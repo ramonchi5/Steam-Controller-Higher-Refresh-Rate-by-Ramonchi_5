@@ -1,0 +1,145 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+  # Build every PR head commit and publish UF2 artifacts for reviewers.
+  pull_request:
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Install adafruit-nrfutil
+        # The Adafruit nRF52 build recipe shells out to adafruit-nrfutil to
+        # package the DFU .zip; it is not bundled with the core on the runner.
+        run: pip install adafruit-nrfutil
+
+      - name: Install Adafruit nRF52 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
+          arduino-cli core update-index
+          arduino-cli core install adafruit:nrf52
+
+      - name: Resolve build version
+        id: build_version
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -eu
+          SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          BASE_VERSION="$(
+            git tag --list \
+              | grep -E "$SEMVER_RE" \
+              | sort -V \
+              | tail -n1 || true
+          )"
+          if [ -z "$BASE_VERSION" ]; then
+            BASE_VERSION="0.9.1"
+          fi
+          SHORT_SHA="$(git rev-parse --short=8 "${HEAD_SHA}")"
+          PR_NUMBER_OR_ZERO="${PR_NUMBER:-0}"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION="${BASE_VERSION}-pr${PR_NUMBER_OR_ZERO}+${SHORT_SHA}"
+            ARTIFACT_VERSION="${BASE_VERSION}-pr${PR_NUMBER_OR_ZERO}-${SHORT_SHA}"
+          else
+            VERSION="${BASE_VERSION}"
+            ARTIFACT_VERSION="${BASE_VERSION}-${SHORT_SHA}"
+          fi
+
+          echo "base_version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER_OR_ZERO" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "artifact_version=$ARTIFACT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate version header
+        env:
+          OPK_BUILD_VERSION: ${{ steps.build_version.outputs.version }}
+        run: ./gen_version.sh
+
+      - name: Compile OpenPuck
+        run: |
+          mkdir -p build/openpuck build/cache/openpuck
+          make build BUILD_PATH=build/cache/openpuck OUTPUT_DIR=build/openpuck
+
+      - name: Compile MDBT50Q-CX-40
+        run: make build-raytac
+
+      - name: Generate UF2 (OpenPuck)
+        # The Adafruit nRF52 core leaves its UF2 objcopy recipe commented out in
+        # platform.txt, so arduino-cli only emits .hex/.zip. Convert the .hex to
+        # a drag-and-drop .uf2 ourselves.
+        run: ./gen_uf2.sh build/openpuck/OpenPuck.ino.hex build/openpuck/OpenPuck.ino.uf2
+
+      - name: Compile ReversePuckFirmware
+        run: |
+          mkdir -p build/reversepuck build/cache/reversepuck
+          make reversepuck BUILD_PATH=build/cache/reversepuck OUTPUT_DIR=build/reversepuck
+
+      - name: Generate UF2 (ReversePuckFirmware)
+        run: ./gen_uf2.sh build/reversepuck/ReversePuckFirmware.ino.hex build/reversepuck/ReversePuckFirmware.ino.uf2
+
+      - name: List build outputs
+        run: |
+          find build/openpuck build/reversepuck -maxdepth 1 -type f -print | sort
+
+      - name: Upload OpenPuck UF2 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenPuck-${{ steps.build_version.outputs.artifact_version }}-standard.uf2
+          retention-days: 7
+          if-no-files-found: error
+          path: build/openpuck/OpenPuck.ino.uf2
+
+      - name: Upload OpenPuck HEX artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenPuck-${{ steps.build_version.outputs.artifact_version }}-standard.hex
+          retention-days: 7
+          if-no-files-found: error
+          path: build/openpuck/OpenPuck.ino.hex
+
+      - name: Upload ReversePuckFirmware UF2 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ReversePuckFirmware-${{ steps.build_version.outputs.artifact_version }}.uf2
+          retention-days: 7
+          if-no-files-found: error
+          path: build/reversepuck/ReversePuckFirmware.ino.uf2
+
+      - name: Upload ReversePuckFirmware HEX artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ReversePuckFirmware-${{ steps.build_version.outputs.artifact_version }}.hex
+          retention-days: 7
+          if-no-files-found: error
+          path: build/reversepuck/ReversePuckFirmware.ino.hex

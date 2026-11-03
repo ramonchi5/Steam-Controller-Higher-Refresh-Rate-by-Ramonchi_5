@@ -1,0 +1,247 @@
+// config.h -- USB-presentation modes + persisted, runtime-tunable settings.
+//
+// One puck speaks the SAME RF protocol no matter which USB face it wears; only the USB enumeration and the
+// input-report mapping change. The active face is g_usbMode, persisted to flash (cfg.bin). Tunables here are
+// set over the CDC console (serial_console.cpp) and the WebUSB panel (webusb_config.cpp) and likewise persist.
+#pragma once
+#include <stdint.h>
+
+// Compile-time logging / diagnostics. 0 (default) = PRODUCTION build: no host->controller capture ring
+// (reclaims ~80KB RAM), no per-event logging, no main-loop section timing, no WebUSB capture channel.
+// Functional bits (haptic reconnect block, buzz-clear re-init, rate stats) stay. -DOPK_LOG=1 for diagnostics.
+#ifndef OPK_LOG
+#define OPK_LOG 0
+#endif
+
+// Build-time FACTORY RESET (recovery build). 0 (default) = normal. -DOPK_FACTORY_RESET=1 wipes ALL persistent
+// storage (cfg.bin + bonds.bin) ONCE -- on the first boot after flashing -- then persists normally. A git-hash
+// tag file (written after the wipe) records that this build already reset, so subsequent boots skip it. Flashing
+// a DIFFERENT build re-triggers the one-time wipe. Re-pair the controller after the reset. See factoryResetOnce().
+#ifndef OPK_FACTORY_RESET
+#define OPK_FACTORY_RESET 0
+#endif
+
+// Optional GPIO trigger wired to the HOST motherboard's front-panel power-switch header: fires a
+// momentary pulse when the paired Steam Controller's STEAM button is short-pressed WHILE the host
+// is off (USB not enumerated). 0 (default) = feature compiled out entirely -- no pin driven, no
+// behavior change for anyone without the extra wiring. -DOPK_PWR_SWITCH=1 to enable. See
+// pwr_switch.h for the pin/timing knobs.
+#ifndef OPK_PWR_SWITCH
+#define OPK_PWR_SWITCH 0
+#endif
+
+// ---- USB presentation modes (g_usbMode). RF poll/relay is identical across all; only USB enumeration +
+//      report mapping differ. ----
+#define MODE_STEAM 0 // Valve puck; auto-lizard when Steam closed
+#define MODE_XBOX 1 // XInput + right-pad mouse
+#define MODE_SW_HORI 2 // HORIPAD (Switch console whitelist)
+#define MODE_LIZARD \
+	3 // Puck HID; always keyboard+mouse (ignores Steam heartbeat)
+#define MODE_SW_PRO 4 // Nintendo Switch Pro Controller (057E:2009) + gyro
+// Sony DualSense (054C:0CE6) + gyro + split trackpad (+ wake mouse + WebUSB panel)
+#define MODE_PS5 5
+// DS4-layout generic HID gamepad + gyro (+ wake mouse + WebUSB panel)
+#define MODE_HIDGYRO 6
+// DualSense, CLEAN single-HID (no wake/WebUSB) so PC games classify it as PlayStation (Fortnite)
+#define MODE_PS5_GAME 7
+// DS4, CLEAN single-HID (no wake/WebUSB) for game PlayStation classification
+#define MODE_DS4_GAME 8
+// Sony DualShock 3 / Sixaxis (054C:0268) -- CLEAN single-HID so it enumerates on a REAL PS3 console (the
+// console wants a bare Sixaxis HID, not a composite). Answers the PS3's GET_REPORT(0xF2/0xF5/0xEF/0x01)
+// enable handshake. + gyro/accel + rumble.
+#define MODE_PS3 9
+// Microsoft Original Xbox Controller S (045E:0289)
+#define MODE_XBOX_OG 10
+// Generic DirectInput joystick -- presents EVERY analog input at once (sticks, triggers, both trackpads, gyro)
+// as two DirectInput devices, for flight/space sims that bind axes through DirectInput rather than XInput.
+#define MODE_DINPUT 11
+// SInput: the open SDL-native gamepad protocol (docs.handheldlegend.com/s/sinput). Sticks + analog triggers +
+// gyro/accel + BOTH trackpads + battery, all bound natively by SDL3 / Steam Input with no impersonation.
+#define MODE_SINPUT 12
+#define MODE_MAX 12
+
+// The two "game" personalities drop the wake-mouse + WebUSB interfaces so the device is a genuine single-HID PS
+// controller (some PC games -- e.g. Fortnite/UE GameInput -- refuse PS classification when extra interfaces are
+// present). Cost: no config panel / host-wake while in these modes; chord back to Steam (back4 + A) for the panel.
+static inline bool modeIsCleanPS(uint8_t m)
+{
+	return m == MODE_PS5_GAME || m == MODE_DS4_GAME || m == MODE_PS3;
+}
+
+static inline bool modeIsPuck(uint8_t m)
+{
+	return m == MODE_STEAM || m == MODE_LIZARD;
+}
+static inline bool modeValid(uint8_t m)
+{
+	return m <= MODE_MAX;
+}
+
+// ---- Emulated controller TYPES. Button-remap config (back paddles / QAM / A-B swap / trackpad haptics) is kept
+//      per-type, not per-mode: the right mapping depends on what controller we present, and the variant modes of
+//      one controller share it. Steam + Lizard are native puck presentations -- they forward raw input to Steam,
+//      which does its own remapping -- so they are NOT emulated types (ET_NONE) and ignore this config. ----
+#define ET_XBOX 0
+#define ET_SWITCH 1
+#define ET_DS4 2
+#define ET_DS5 3
+#define ET_COUNT 4
+#define ET_NONE 0xFF
+static inline uint8_t etypeForMode(uint8_t m)
+{
+	switch (m) {
+	case MODE_XBOX:
+	// OG Xbox Controller S shares the Xbox layout / button config minus guide button
+	case MODE_XBOX_OG:
+		return ET_XBOX;
+	case MODE_SW_HORI:
+	case MODE_SW_PRO:
+		return ET_SWITCH;
+	case MODE_HIDGYRO:
+	case MODE_DS4_GAME:
+	case MODE_PS3: // DS3 shares the PlayStation face layout / button config
+		return ET_DS4;
+	case MODE_PS5:
+	case MODE_PS5_GAME:
+		return ET_DS5;
+	default:
+		// Steam / Lizard forward raw input for the host to remap. DirectInput and SInput expose every
+		// physical button as its own bindable button (paddles included), so they have nothing to remap
+		// either -- binding happens in the sim / in SDL.
+		return ET_NONE;
+	}
+}
+
+extern uint8_t g_usbMode; // loaded from flash at boot
+
+// true for all non-puck presentations (cached !modeIsPuck(g_usbMode))
+extern bool g_xbox;
+extern uint8_t g_chordBtn[3]; // back4+B/X/Y -> these modes (A always STEAM)
+
+// back4+D-pad -> these modes, indexed CHD_LEFT/UP/RIGHT/DOWN. Same deal as g_chordBtn: configurable from the
+// panel, defaults reach the console modes that have no config interface (so a controller-only route in exists).
+#define CHD_LEFT 0
+#define CHD_UP 1
+#define CHD_RIGHT 2
+#define CHD_DOWN 3
+extern uint8_t g_chordDpad[4];
+
+// Mode persistence policy: by DEFAULT every fresh power-on/reconnect lands in STEAM mode (0). An explicit
+// mode switch still works for the session via a ONE-SHOT bootMode (honored once, then cleared). g_persistMode
+// instead remembers the last selected mode across reboots.
+// false (default) = always boot Steam; true = boot into last mode
+extern bool g_persistMode;
+// one-shot: boot into this mode once then clear (!persistMode + explicit switch)
+extern uint8_t g_bootMode;
+
+extern bool g_isMachineInternal;
+
+// One-shot debug CDC. Puck mode normally DROPS the CDC serial console to free the USB endpoint its wake-mouse
+// interface needs (to wake a sleeping Windows host). Arming this keeps CDC for the NEXT boot only -- dropping
+// the wake mouse that boot -- to attach the serial debugger; the boot after reverts automatically.
+// decision for THIS boot: true => keep CDC, skip the wake interface
+extern bool g_debugCdcThisBoot;
+void armDebugCdcNextBoot(); // persist the one-shot (caller reboots)
+
+// persisted, runtime-tunable config:
+extern int g_mDiv, g_mFric; // xbox/lizard mouse sensitivity divisor / friction%
+
+// Per-emulated-type button config. One entry per ET_* type. back[] = paddle L4,R4,L5,R5 -> button codes
+// (0..15 standard, 16=PS Touch Click, 17=PS5 Mute, 18=Switch Capture/Screenshot). qamMap = QAM (3 dots)
+// physical button -> same code space (0 = default/unmapped). abSwap = swap A/B and X/Y (Nintendo layout).
+// padHaptics = 1 keeps the controller's autonomous trackpad haptics, 0 disables them for this type.
+// rumble = 1 enables host rumble relay (default), 0 silences it for this type.
+// ledBright = LED brightness sent to the controller on connect: 0 = no override (controller default),
+// 1-100 = brightness %. Steam sets brightness each session; emulated modes never do, so the controller
+// comes up at full brightness. Setting a value here preserves the preferred brightness across mode switches.
+struct TypeCfg {
+	uint8_t back[4];
+	uint8_t qamMap;
+	uint8_t abSwap;
+	uint8_t padHaptics;
+	uint8_t ledBright;
+	uint8_t rumble;
+};
+extern TypeCfg g_type[ET_COUNT];
+
+// Trackpad -> analog stick mapping, per emulated type: {left pad, right pad}, values PS_OFF/PS_LEFT/PS_RIGHT.
+// While the mapped pad is touched its coordinates drive that stick; releasing it re-centers the stick (the
+// physical stick still drives it whenever the pad is untouched). Kept OUTSIDE TypeCfg so the on-flash Cfg
+// layout only grows in its tail -- an existing cfg.bin still loads and keeps every other setting.
+#define PS_OFF 0
+#define PS_LEFT 1
+#define PS_RIGHT 2
+#define PS_MAX 2
+extern uint8_t g_padStickCfg[ET_COUNT][2];
+extern uint8_t
+	g_etype; // etypeForMode(g_usbMode), resolved at boot (ET_NONE for puck modes)
+
+// Live, resolved-active-type mirrors of g_type[g_etype], read by the hot-path mode builders. Refreshed by
+// applyActiveType() at boot and after any edit to the active type.
+extern uint8_t g_abSwap; // 1 = swap A/B and X/Y (Nintendo face-button layout)
+extern uint8_t g_back[4];
+extern uint8_t g_qamMap;
+extern uint8_t
+	g_padHaptics; // 1 = trackpad haptics on (default), 0 = disabled for the active type
+// 1 = host rumble relay on (default), 0 = silenced for the active emulated type
+extern uint8_t g_rumble;
+// LED brightness for the active emulated type (0 = no override, 1-100 = brightness %)
+extern uint8_t g_ledBright;
+// Live mirror of g_padStickCfg[g_etype]: {left pad, right pad} -> stick (PS_*).
+extern uint8_t g_padStick[2];
+
+// Copy g_type[g_etype] into the live mirrors above (safe defaults when g_etype == ET_NONE).
+void applyActiveType();
+// Switch Pro motion setting. Persisted in its OWN flash file (mode_switch_pro.cpp), NOT in Cfg -- so changing
+// it never resets the rest of the config. Set from the WebUSB panel.
+// Switch Pro gyro mapping: 0 = corrected (default, PR #189 sensitivity trim), 1 = legacy (raw, pre-#189)
+extern uint8_t g_swGyroLegacy;
+
+// persist g_swGyroLegacy to its flash file
+void swProSaveCfg();
+
+// RF poll cadence: 1000 Hz (1000 us) default in our 1-Controller High-Refresh-Rate build (overrideable at
+// compile time via -DPOLL_US_DEFAULT=2000u for the 500 Hz fallback image). The controller does NOT stream
+// on its own; the puck POLLS (short frame) and the controller auto-ACKs one input frame per poll (RE air
+// capture, nrf-sniffer HANDOFF.md), and it stuffs fresh IMU into every report, so the DELIVERED report
+// rate tracks the poll rate up to the controller's sensor cadence while minimizing RF queueing latency.
+#ifndef POLL_US_DEFAULT
+#define POLL_US_DEFAULT 1000u
+#endif
+// host-side HID stream cadence for translated modes (~250 Hz)
+#define USB_STREAM_MS 4u
+// How long a USB suspend must PERSIST before we power the controllers off. A brief selective-suspend
+// (host idle power-management) resumes in <1s and must not trigger a self-inflicted power-off -> the
+// resulting disconnect/reconnect churn looked like random controller drops. Real host sleep persists.
+#define SUSPEND_OFF_MS 4000u
+// RF poll cadence (us). Defaults to POLL_US_DEFAULT; live-adjustable and persisted via WebUSB field 9 or
+// console "PR<hz>" (automatically resets to POLL_US_DEFAULT if a different rate UF2 build is flashed).
+extern uint32_t g_pollUs;
+// 1-Controller Exclusive RF Air-Time mode (ON by default): once 1 controller is connected, suppresses ch2
+// multi-controller discovery beacons (unless pairing is active) and skips cold-slot probing so 100% of RF
+// air budget is dedicated to the single active controller.
+extern bool g_singleCtrlMode;
+void persistCustomPollUs(uint32_t pollUs);
+
+// loop-timing diagnostics (defined in OpenPuck.ino) -- surfaced in the WebUSB status blob to find what caps
+// the poll rate: avg loop period, slowest section index, and that section's avg us/iteration.
+extern uint16_t g_loopPeriodUs;
+extern uint8_t g_loopWorst;
+extern uint16_t g_loopWorstUs;
+
+#define CFG_EXT_STORAGE_BYTES 10u
+uint8_t cfgExtRead(uint8_t index);
+void cfgExtWrite(uint8_t index, uint8_t value);
+
+void loadCfg();
+void saveCfg();
+// FULL factory wipe: reformat the internal LittleFS, erasing cfg.bin (modes/tunables/chords) AND bonds.bin
+// (paired controller). Irreversible; the caller reboots so the next boot comes up on clean defaults and the
+// controller must be re-paired. Gated behind explicit confirmation at every call site.
+void factoryErase();
+// One-time factory reset for the -DOPK_FACTORY_RESET recovery build: wipe ONCE on the first boot after flashing
+// (tracked by a git-hash tag file so it doesn't wipe on every boot), then persist normally. buildTag = OPK_GIT_HASH.
+void factoryResetOnce(const char *buildTag);
+// Mode switch (chord / WebUI): persist mode if the toggle is on, else arm a one-shot so this reboot lands in
+// the new mode but the next cold boot returns to Steam. Either way saveCfg + caller reboots.
+void saveMode(uint8_t m);

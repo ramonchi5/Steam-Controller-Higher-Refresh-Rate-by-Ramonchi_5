@@ -1,0 +1,154 @@
+# OpenPuck
+
+[![BuyMeACoffee](https://raw.githubusercontent.com/pachadotdev/buymeacoffee-badges/main/bmc-yellow.svg)](https://github.com/safijari/openpuck/discussions/211)
+
+OpenPuck is an opensource firmware for NRF52840 Pro Micro that copycats the Steam Controller 2 Puck and allows emulation of Xbox, Original Xbox, Switch, and PS3/4/5 controllers and also includes an independant lizard mode (which can work on UAC prompts/task manager/etc). The Switch, PS3, and Original Xbox modes have been verified to work on real consoles and Switch, PS4/5 modes have gyro (and touchpad where available) hooked in. Back 4 buttons are mappable for all emulated modes.
+
+> [!WARNING]
+> Every part of this project _HEAVILY_ used LLMs*
+
+# The Steam Controller 2
+Released in 2026, the Steam Controller 2 represents the peak (IMO) of controller design. Trackpads, gyro, 4 back buttons, all with the flexibility of Steam Input brings the amazing flexiblity of the Steam Deck's controls to gaming PCs in general.
+
+The "puck" is what the controller uses for wireless communication with the host device. It can handle 4 controllers paired to it at the same time and can run at a very low latency with all 4 connected. While the controller has a bluetooth mode too it has over twice the latency so the puck is truly where it's at.
+
+# The Problem
+There are two fundamental problems with the controller:
+
+1. The puck is not (yet) available for purchase separately from the controller so if you want a replacement or a second one (a single controller can pair to two) you're out of luck. Given Valve's track record I predict it'll never be available to buy as a separate accessory.
+
+2. Steam Input isn't just a nicety, it's a requirement. This means that the controller is basically useless unless you have Steam running (outside of certain contexts that I personally consider niche). If, for example, you have gamepass and want to play FH6 through Gamepass you're gonna be in for a bad time and you'll probalby need specialized software running on your computer in order to make the controller work with it.
+
+# What this project does
+**Video Intro**
+
+[![OpenPuck Intro](https://img.youtube.com/vi/gSaqO9oqq9s/0.jpg)](https://www.youtube.com/watch?v=gSaqO9oqq9s)
+
+OpenPuck uses a [Pro Micro NRF52840](https://www.amazon.com/dp/B0GSZ7FD6T) ($8 on Amazon, possibly cheaper elsewhere) which uses a radio similar to the one being used by the controller and the puck. Once the arduino sketch is uploaded it emulates the puck over USB to Steam by default and allows pairing the controller normally (almost, the lizard mode for when Steam is off might not be 1:1). Latency [has been measured to be within 1ms of the official puck](https://www.reddit.com/r/SteamController/comments/1u754ze/complete_latency_testing_of_openpuck_project/).
+
+At any point you can hold all 4 back buttons and press X (the default assignment) to switch over to **Xbox mode**, which maps canonical inputs to their expected counterparts (plus configurable back-button mappings). It presents **one static wired Xbox 360 controller**, with input and rumble, but no right-trackpad mouse, WebUSB, or wake HID. Retail authentication runs in software on the existing nRF52840 OpenPuck; no donor controller or extra hardware is required.
+
+**Stock Xbox 360 console support is experimental and awaiting physical validation.** The default firmware build passed with Adafruit nRF52 core 1.7.0, but this firmware has **not been flashed or tested on a console**. Native tests use independent synthetic fixtures, not console captures or proof of compatibility. Headsets/chatpads are not emulated, and physical player-ring behavior is not equivalent to a genuine pad. See [docs/XBOX360.md](docs/XBOX360.md) for constraints and the hardware test checklist.
+
+Similarly you can hold all 4 back buttons and press Y to switch (teehee) over to a **Switch mode**. This emulates a pro controller full with gyro and haptics. There's other modes as well:
+
+| Button combo (configurable) | Mode | Comment |
+|---|---|---|
+| back-4 + A | Steam | Steam Controller Mode |
+| back-4 + B | Lizard | Lizard mode, even if Steam is open |
+| back-4 + X | Xbox | One wired Xbox 360 pad; stock-console support experimental, untested |
+| back-4 + Y | Switch Pro | Switch Controller + Gyro + Haptics |
+| WebUSB panel → mode 4 | Hori Pad | Switch mode with no gyro or haptics |
+| WebUSB panel → mode 5 | DualSense + Gyro + Trackpad | PC only |
+| WebUSB panel → mode 6 | DS4/HIDGYRO + Gyro + Trackpad | PC only |
+| WebUSB panel → mode 9 | PS3 DualShock 3 / Sixaxis | Enumerates on a real PS3 (+ gyro/haptics) |
+| WebUSB panel → mode 10 | Original Xbox Controller S | Enumerates on a real Original Xbox |
+| WebUSB panel → mode 11 | DirectInput (flight/space sims) | Every axis at once, as two DirectInput joysticks |
+| WebUSB panel → mode 12 | SInput (SDL-native) | Sticks + analog triggers + gyro + both trackpads + battery |
+
+**DirectInput mode** exists because Steam Input funnels everything through XInput, so only a handful of the
+controller's analog inputs can be live at once — a problem for flight and space sims, which bind axes through
+DirectInput. DirectInput itself caps a device at 8 axes, so this mode presents the controller as **two**
+joysticks (two HID collections, one USB interface):
+
+| Device | Axes | Buttons |
+|---|---|---|
+| #1 | X/Y = left stick, Rx/Ry = right stick, Z/Rz = left/right trigger, hat = D-pad | 1-26: A B X Y, LB RB, LT RT, Start, Select, L3 R3, D-pad U D L R, L4 R4 L5 R5, pad clicks, pad touches, Steam, QAM |
+| #2 | X/Y = left trackpad, Rx/Ry = right trackpad, Z/Rz/Slider = gyro X/Y/Z | 1-4: left/right pad click, left/right pad touch |
+
+Trackpad axes **latch**: they hold the last touched position (so a pad works as a throttle/trim slider) and
+re-centre when you *click* that pad. No remapping is applied in this mode — every physical button, paddles
+included, is its own bindable button, since the sim does the binding. The mode is input-only: DirectInput
+force feedback is a separate HID class, so rumble is not wired up here (use another mode if you want rumble).
+DirectInput is a Windows API — on Linux/SteamOS the SInput mode below is the one that exposes everything.
+
+**SInput mode** speaks [SInput](https://docs.handheldlegend.com/s/sinput), Hand Held Legend's open gamepad
+protocol that SDL3 and Steam Input bind with a dedicated driver. It is the one mode that doesn't impersonate
+anybody: sticks, *both* analog triggers, gyro + accelerometer, **both** trackpads (as two touchpads) and the
+battery level are all reported natively and simultaneously, with rumble coming back from the host. It needs an
+SDL build that ships the SInput driver (SDL 3.4+ / a current Steam client); older hosts fall back to seeing a
+plain HID gamepad.
+
+**Rumble tuning.** In the translated modes (Xbox, Switch, PlayStation) the puck decodes the host's rumble packet itself, so the WebUSB panel's **Rumble** card can reshape it before it reaches the controller. *Strength* scales the amplitude the game asked for (200% is the default and matches previous firmware). *Style* picks how the two motors are driven: mono runs both at the stronger value, heavy and light mute one motor each, punchy softens weak effects while leaving strong ones alone, and soft lifts weak ones so subtle rumble is felt. A **Test rumble** button buzzes the controller with the current settings so you can compare without launching a game. Steam mode relays Steam's own haptics untouched, so these settings don't apply there.
+
+I'm also adding various QOL items as I go as well. For example having to hold the Steam button for like 6 seconds feels like an eternity. If Steam is open you can do Steam + Y for a shutdown. I'm adding Steam + Y for 2 seconds as a shutdown chort in ALL modes now.
+
+Note: to use the Switch mode on a real Switch you'll need to [enable the pro controller wired communication option](https://www.nintendo.com/en-gb/Support/Troubleshooting/How-to-Enable-Disable-Pro-Controller-Wired-Communication-1516284.html).
+
+### A note on the Lizard mode:
+The Lizard mode behaves similarly to how the controller behaves when Steam is closed, but this will work even when Steam is open. This has a few advantages
+the biggest one being that you can use inputs when a high privilege application is in the foreground (like the Task Manager, when using Steam if you wanna be able to do that Steam must be run as admin).
+
+Additionally it has some shortcuts that might be useful: Steam + L5/R5 will do volume control, RB is Alt so you can RB + Select to move through windows, LB is Ctrl 
+and Steam + L4 ls Ctrl + Alt + Delete.
+
+# How to install/use it
+### Video demo
+
+[![OpenPuck Installation](https://img.youtube.com/vi/1YyDq-KX3dc/0.jpg)](https://www.youtube.com/watch?v=1YyDq-KX3dc)
+
+The easiest way to install is to grab a uf2 file from the GitHub releases and drag and drop it onto the folder that the microcontroller mounts when in DFU mode. Fresh microcontrollers should already be in DFU mode and present like a flash drive. If they are not in DFU mode you'll need to short the RST and GND pints twice in quick succession. If you've already flashed openpuck you can update it straight from the [webusb configurator](https://safijari.github.io/openpuck/)'s **Firmware update** tab: pick a version from the built-in releases list (with an optional factory-reset variant), or drag and drop a `.uf2` — the firmware is sent to the puck over the same WebUSB connection, verified on-device, and applied automatically on a reboot. A failed or interrupted transfer leaves the running firmware untouched, and even a power cut during the apply just leaves the puck in its UF2 bootloader (drag-and-drop recovery) — it can't end up half-flashed. The `UF2 DFU` button still reboots into the mass-storage bootloader for manual drag-and-drop.
+
+See [build instructions document](./docs/BUILD_AND_DEPLOY.md) for  details on how to flash the MCU during development.
+
+# Pairing
+Both OpenPuck and the controller need to be hooked up to the same machine with a data capable USB C cable at the same time and Steam must be running. Steam should in most cases automatically pop up a menu to pair the controller. If not, you can go to Settings -> Controllers and press "Add Controller".
+
+If you want to use the second slot for OpenPuck, you'll need to first turn the controller off and then hold LB + A + Steam to turn the controller back on (the chime when the controller comes on in this mode sounds different). Then connect the USB C cable and continue to pair.
+
+Switching slots requires turning the controller off (Steam + Y if steam is running, Steam + Y held for 2 seconds if Steam isn't running or if you're in a different mode, or just hold the Steam button for an eternity until the controller shuts off) and then you hold RB for slot 1 and LB for slot 2 while holding A and Steam to turn the controller back on.
+
+# Configuration
+A webusb based configuration UI is available [here](https://safijari.github.io/openpuck/). It allows Switching the mode manually and changing the back button mapping for other modes among other things. This will likely only work in Chrome and Edge and needs the pro micro to be connected via USB to the same computer for it to function. Note that it might not work in all modes on all machines but should always work in the Steam Controller mode (which you can revert to with back-4 + A). Note that in some modes the webusb connection might not work. If you're encountering that try going back to the Steam Controller mode and unplugging and replugging the dongle.
+
+Xbox mode deliberately has no WebUSB interface, including for firmware updates. Hold **L4 + R4 + L5 + R5 + A** to return to Steam mode on a PC, configure or update there, then use **back-4 + X** to return to Xbox (unless X has been reassigned). The A recovery chord is fixed; the B/X/Y assignments are configurable. Pair controllers in Steam mode first. Xbox selects the first fresh RF input source and keeps it until disconnect; four stored bonds do not become four Xbox gamepads.
+
+If you're running Linux and your browser still shows "disconnected" after selecting the OpenPuck in the device selector, it's probably a permissions issue. Check [this document](./docs/WEBUSB_LINUX.md) for more details.
+
+You can copy configurations between OpenPucks using the export/import card in this webusb UI as well. This allows for some interesting [hotswapping capability](https://www.youtube.com/watch?v=6RnsXVlHAoM) where controllers can switch between pucks without needing to swap slots.
+
+# 3D Printed Cases
+- [jaki-gh](https://github.com/jaki-gh) has contributed a 3D printable housing with OpenPuck written on it alongside a Steam logo. You can find that [here](https://www.thingiverse.com/thing:7371668).
+- [BOT-Yanni](https://www.reddit.com/user/BOT-Yanni/) designed a slim case with OpenPuck written on it and a cute little glyph of the Steam Controller. You can find that [here](https://www.thingiverse.com/thing:7379316).
+- [StonnedModder](https://www.printables.com/model/1760684-openpuck-promicro-nrf52840-case) built a case meant to accomodate a USB C to USB A adapter which you can find [here](https://www.printables.com/model/1760684-openpuck-promicro-nrf52840-case).
+- Another plain case for these pro micros can be found [here](https://www.printables.com/model/1285346-pro-micro-nicenano-nrf52840-dongle-case/collections).
+- Possibly [the cutest case](https://www.printables.com/model/1830063-openpuck-case-pro-micro-nrf52840) by TheMeanCanEHdian
+
+# ReversePuck
+This is a tool to emulate a Steam Controller 2 with almost all of its inputs (except grip) using a Steam Deck and allow it to connect over a low latency 2.4ghz connection to OpenPuck (this does not work with the official puck yet). Flash the firmware onto an NRF52840 Pro Micro and copy over the ReversePuck folder onto the Steam Deck (you might need to install UV). Then add the ReversePuck script as a non steam game. Attach both the dongle and OpenPuck to the same machine and do pairing through Steam (which will say pairing has failed but it's actually fine). Then connect the OpenPuck to whatever machine you want to use your controllers on and the dongle to the Steam Deck. Launch the ReversePuck app in gamemode and you'll see the serial number of the OpenPuck show up in green. Press it and it'll turn blue at which point the Deck will show up as a controller on the host device. See video below for a demonstration of this in action (yes, other Steam Controllers can be connected to the same OpenPuck at the same time).
+
+[![ReversePuck Demo](https://img.youtube.com/vi/q_AvvpFn4A8/0.jpg)](https://www.youtube.com/watch?v=q_AvvpFn4A8)
+
+# ColdBoot Functionality
+ColdBoot lets a paired Steam Controller turn the PC on from a fully off state: a short press of the Steam button makes the puck pulse a GPIO pin that closes the motherboard's power-switch circuit, exactly like pressing the case power button. It works because the USB port keeps standby power on the board while the PC is off, so the puck stays awake and keeps listening. It only fires when the host is genuinely off (USB not enumerated), so it can't send a stray power press during normal use.
+
+This needs a little extra wiring (one resistor, one transistor, two wires to the front-panel header) and is off by default in the firmware -- build it with `make uf2 EXTRA_FLAGS="-DOPK_PWR_SWITCH=1"`.
+
+Bill of materials, schematic, and step-by-step wiring instructions: [How to wire up an NRF52 board for cold boot](https://github.com/safijari/openpuck/wiki/How-to-wire-up-an-NRF52-board-for-cold-boot).
+
+# Future work
+- Validate experimental wired Xbox 360 mode on stock consoles (the clean USB layout intentionally omits a mouse)
+- Design the charging portion (and make it short proof)
+- Make ReversePuck into a system that you can plug into most controllers and allow them to talk to OpenPuck
+- A BLE version of OpenPuck that can allow Steam Controllers and other BLE controllers to coexist
+
+# Contributions
+The firmware is split into small, single-responsibility modules under `OpenPuck/` (one file per emulated controller, plus the RF, config, and host-interface layers). Start with [ARCHITECTURE.md](./ARCHITECTURE.md) for the map of how it all fits together and how to add a new USB personality.
+
+I have tested this software fairly extensively but I have limited resources. Please submit issues with any issues you find. PRs also welcome of course.
+
+# Acknowledgements
+- Valve for putting out the amazing controller
+- Whoever wrote the drivers for SDL / Linux
+- Alan for not scalping and selling me this controller for $120
+- https://github.com/knflrpn/2wiCC for the Switch Pro controller mode help
+- Massive thanks to [u/Careful_Tune4744](https://www.reddit.com/user/Careful_Tune4744/) for latency testing as well as testing and giving feedback on the Switch Pro mode
+- Thanks to Lawstorant from a mutual discord server for constructive criticism of the repo's state
+- Everyone that participated in [issue #17](https://github.com/safijari/openpuck/issues/72) or reported/tested stability issues on various boards
+
+Xbox authentication includes InvoxiPlayGames' **libxsm3 (LGPL-2.1-or-later)** and **ExCrypt (BSD-3-Clause)**; its USB descriptor layout is adapted from **GP2040-CE (MIT)**. Retain the notices and license texts when redistributing, and satisfy the LGPL source/relinking obligations for statically linked firmware. See [OpenPuck/src/libxsm3/NOTICE.md](OpenPuck/src/libxsm3/NOTICE.md), [OpenPuck/src/libxsm3/LICENSE.txt](OpenPuck/src/libxsm3/LICENSE.txt), the MIT notice in [OpenPuck/xinput_descriptors.h](OpenPuck/xinput_descriptors.h), and [docs/XBOX360.md](docs/XBOX360.md#licensing-and-redistribution).
+
+# * On LLM Use 
+Everything from discovery of the protocol to writing the arduino sketch and running various automated benchmarks invovled Claude and Codex. This readme is the only organic, single origin, ethically sourced and humanely slaughtered assemblage of words in this project. I have done my level best to review the code and I invite anyone concerned about the stability or security of this project to do the same. I test thoroughly and obsessively as the primary purpose of this project is to bring some much needed QOL to my own use of the Steam Controller.
+
+I want nothing more than for there to be a fully human coded alternative to OpenPuck that's on par with or better in every way. I would love to stop working on OpenPuck. If someone builds an alternative that matches this criteria I would also happily change the name of this project and archive this repo.

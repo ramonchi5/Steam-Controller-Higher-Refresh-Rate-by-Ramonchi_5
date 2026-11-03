@@ -1,0 +1,7 @@
+bin/
+obj/
+.vs/
+.tools/
+*.user
+*.bak.*
+firmware/openpuck-highrate/build/

@@ -1,0 +1,675 @@
+diff --git a/OpenPuck/OpenPuck.ino b/OpenPuck/OpenPuck.ino
+index b43a148..0030f15 100644
+--- a/OpenPuck/OpenPuck.ino
++++ b/OpenPuck/OpenPuck.ino
+@@ -125,9 +125,8 @@ void modeSwitchReboot(uint8_t mode)
+ 	const uint32_t selfResetPin = NRF_GPIO_PIN_MAP(0, 16);
+ 	nrf_gpio_pin_clear(selfResetPin);
+ 	nrf_gpio_cfg_output(selfResetPin);
+-	while (true) {
+-		// P0.16 drives P0.18 low; reset should occur immediately.
+-	}
++	delay(10);
++	NVIC_SystemReset();
+ #else
+ 	NVIC_SystemReset();
+ #endif
+diff --git a/OpenPuck/config.cpp b/OpenPuck/config.cpp
+index 44d9e24..0ae36cb 100644
+--- a/OpenPuck/config.cpp
++++ b/OpenPuck/config.cpp
+@@ -1,6 +1,7 @@
+ #include "config.h"
+ #include "rf_link.h" // g_rxWin (poll RX window persisted here)
+ #include "haptics.h" // g_hapticBlockOn, g_hapticBlockMs
++#include "puck_hid.h" // g_fwdContentDedup (persisted in cfgExt[6])
+ #include <Adafruit_LittleFS.h>
+ #include <InternalFileSystem.h>
+ #include <string.h>
+@@ -81,11 +82,11 @@ void applyActiveType()
+ 	g_padStick[0] = g_padStickCfg[g_etype][0];
+ 	g_padStick[1] = g_padStickCfg[g_etype][1];
+ }
+-// poll rate defaults to POLL_US_DEFAULT (250 Hz), matching the real Valve puck (see config.h). The
+-// delivered report rate equals the poll rate (fresh IMU in every reply). Live-adjustable via console
+-// "PR<hz>" for on-HW sweeps; session-only, so any rate persisted by an older build is ignored and boot
+-// always starts at the default (see loadCfg).
++// poll rate defaults to POLL_US_DEFAULT (1000 us = 1000 Hz in the primary 1-controller build, or 2000 us =
++// 500 Hz in the fallback build). Live-adjustable via console "PR<hz>" or WebUSB field 9; persisted across
++// reboots of the same build via cfgExt[3..4] while still honoring a newly flashed UF2's POLL_US_DEFAULT.
+ uint32_t g_pollUs = POLL_US_DEFAULT;
++bool g_singleCtrlMode = true;
+ 
+ #define CFG_FILE "/cfg.bin"
+ // Struct layout/semantics changed (TypeCfg gained rumble byte); bump so old flash format is discarded ->
+@@ -203,9 +204,25 @@ void loadCfg()
+ 				g_debugCdc = 0;
+ 				consume = true;
+ 			}
+-			// poll rate is fixed; rewrite cfg so the persisted byte matches the new default.
+-			if (c.pollU100 != (uint8_t)(POLL_US_DEFAULT / 100))
+-				consume = true;
++			// Honor an explicit user poll-rate override (cfgExt[3] == 0xA5) ONLY if it was saved on a
++			// build with the same compiled POLL_US_DEFAULT (cfgExt[4]). Flashing a different default-rate
++			// UF2 (e.g. 1000 Hz <-> 500 Hz) automatically adopts the new image's POLL_US_DEFAULT.
++			const uint8_t defU100 = (uint8_t)(POLL_US_DEFAULT / 100u);
++			if (cfgExtRead(3u) == 0xA5u && cfgExtRead(4u) == defU100 &&
++			    c.pollU100 >= 10u && c.pollU100 <= 100u) {
++				g_pollUs = (uint32_t)c.pollU100 * 100u;
++			} else {
++				g_pollUs = POLL_US_DEFAULT;
++				if (cfgExtRead(3u) == 0xA5u || c.pollU100 != defU100) {
++					cfgExtWrite(3u, 0xFFu);
++					cfgExtWrite(4u, defU100);
++					consume = true;
++				}
++			}
++			if (cfgExtRead(5u) <= 1u)
++				g_singleCtrlMode = (cfgExtRead(5u) != 0u);
++			if (cfgExtRead(6u) <= 1u)
++				g_fwdContentDedup = cfgExtRead(6u);
+ 			// boot-mode policy: a one-shot bootMode (explicit switch when !persist) wins once then clears;
+ 			// otherwise persist->last mode, else->Steam.
+ 			if (c.bootMode != 0xFF) {
+@@ -279,6 +296,18 @@ void loadCfg()
+ 	}
+ }
+ 
++void persistCustomPollUs(uint32_t pollUs)
++{
++	if (pollUs < 1000u)
++		pollUs = 1000u;
++	else if (pollUs > 10000u)
++		pollUs = 10000u;
++	g_pollUs = pollUs;
++	cfgExtWrite(3u, 0xA5u);
++	cfgExtWrite(4u, (uint8_t)(POLL_US_DEFAULT / 100u));
++	saveCfg();
++}
++
+ void saveMode(uint8_t m)
+ {
+ 	if (g_persistMode) {
+diff --git a/OpenPuck/config.h b/OpenPuck/config.h
+index 876f27c..db60bd9 100644
+--- a/OpenPuck/config.h
++++ b/OpenPuck/config.h
+@@ -200,23 +200,28 @@ extern uint8_t g_swGyroLegacy;
+ // persist g_swGyroLegacy to its flash file
+ void swProSaveCfg();
+ 
+-// RF poll cadence: 250 Hz (4000 us) -- matches the real Valve puck's rate. The controller does NOT stream
++// RF poll cadence: 1000 Hz (1000 us) default in our 1-Controller High-Refresh-Rate build (overrideable at
++// compile time via -DPOLL_US_DEFAULT=2000u for the 500 Hz fallback image). The controller does NOT stream
+ // on its own; the puck POLLS (short frame) and the controller auto-ACKs one input frame per poll (RE air
+ // capture, nrf-sniffer HANDOFF.md), and it stuffs fresh IMU into every report, so the DELIVERED report
+-// rate simply equals the poll rate. The real puck polls ~230-250 Hz, so we match it here. (The genuine
+-// smoothness bug was never the rate -- it was onReport45 dropping ~1/3 of captured reports via a bogus
+-// hid.ready() gate; see puck_hid.cpp. Poll rate is live-tunable via console "PR<hz>" for sweeps.)
+-#define POLL_US_DEFAULT 4000u
++// rate tracks the poll rate up to the controller's sensor cadence while minimizing RF queueing latency.
++#ifndef POLL_US_DEFAULT
++#define POLL_US_DEFAULT 1000u
++#endif
+ // host-side HID stream cadence for translated modes (~250 Hz)
+ #define USB_STREAM_MS 4u
+ // How long a USB suspend must PERSIST before we power the controllers off. A brief selective-suspend
+ // (host idle power-management) resumes in <1s and must not trigger a self-inflicted power-off -> the
+ // resulting disconnect/reconnect churn looked like random controller drops. Real host sleep persists.
+ #define SUSPEND_OFF_MS 4000u
+-// RF poll cadence (us). Defaults to POLL_US_DEFAULT; live-adjustable via the console "PR<hz>" command
+-// (session-only -- NOT persisted; loadCfg always forces the default on boot) so the sweet spot can be
+-// swept on hardware while watching the delivered report rate.
++// RF poll cadence (us). Defaults to POLL_US_DEFAULT; live-adjustable and persisted via WebUSB field 9 or
++// console "PR<hz>" (automatically resets to POLL_US_DEFAULT if a different rate UF2 build is flashed).
+ extern uint32_t g_pollUs;
++// 1-Controller Exclusive RF Air-Time mode (ON by default): once 1 controller is connected, suppresses ch2
++// multi-controller discovery beacons (unless pairing is active) and skips cold-slot probing so 100% of RF
++// air budget is dedicated to the single active controller.
++extern bool g_singleCtrlMode;
++void persistCustomPollUs(uint32_t pollUs);
+ 
+ // loop-timing diagnostics (defined in OpenPuck.ino) -- surfaced in the WebUSB status blob to find what caps
+ // the poll rate: avg loop period, slowest section index, and that section's avg us/iteration.
+diff --git a/OpenPuck/haptics.cpp b/OpenPuck/haptics.cpp
+index 528afd4..ec0bfb5 100644
+--- a/OpenPuck/haptics.cpp
++++ b/OpenPuck/haptics.cpp
+@@ -469,8 +469,10 @@ void rfConnQueueHapticRelay()
+ // rfConnFlushRelay(ch, s1): drain one entry from the current slot's relay queue and TX it. Each slot's queue
+ // is independent, so each controller only sees its own commands. With N connected slots the per-slot relay
+ // rate is 1/N of the per-cycle rate; sustained buzz streams are still 1 packet/cycle/slot.
+-bool rfConnFlushRelay(uint8_t ch, uint8_t s1)
++bool rfConnFlushRelay(uint8_t ch, uint8_t s1, uint8_t *outRxLen)
+ {
++	if (outRxLen)
++		*outRxLen = 0;
+ 	int cur = (g_curSlot >= 0 && g_curSlot < NSLOT) ? g_curSlot : 0;
+ 	// Snapshot one entry under a short critical section. relayEnqueue() (the producer) runs on the
+ 	// high-priority usbd task and, when the ring is full, evicts the oldest by advancing g_rqTail itself --
+@@ -571,9 +573,11 @@ bool rfConnFlushRelay(uint8_t ch, uint8_t s1)
+ 			// full F1 decode (seq-dedup guards double-forward), so a drag streaming haptics now collects
+ 			// ~2x the samples, closing the gap to the real puck. A present reply returns early (~90us);
+ 			// only a genuine no-reply pays the bounded 400us window, so airtime stays in budget.
+-			rfConnTx(
++			uint8_t rx = rfConnTx(
+ 				ch, s1, p, plen,
+-				400); // one relay per poll cycle -- reply harvested as input
++				550); // one relay per poll cycle -- reply harvested as input (550us covers 66B 0x42+0x43)
++			if (outRxLen)
++				*outRxLen = rx;
+ 		}
+ 	}
+ 	return have; // true = a relay frame went out this cycle (its reply is harvested as input, above)
+diff --git a/OpenPuck/haptics.h b/OpenPuck/haptics.h
+index 9626e56..837b1bd 100644
+--- a/OpenPuck/haptics.h
++++ b/OpenPuck/haptics.h
+@@ -170,8 +170,8 @@ void hapticStabTask();
+ 
+ void rfConnQueueHapticRelay();
+ // returns true if a relay frame was actually transmitted this call (queue had an entry), so the poll loop can
+-// count relay TXs separately from poll cycles.
+-bool rfConnFlushRelay(uint8_t ch, uint8_t s1);
++// count relay TXs separately from poll cycles. Optional outRxLen reports the harvested F1 reply length.
++bool rfConnFlushRelay(uint8_t ch, uint8_t s1, uint8_t *outRxLen = nullptr);
+ // times a relay-ring drain hit its iteration cap (head/tail desync or corruption) -- non-zero means we caught
+ // and recovered from what would otherwise be an IRQ-off watchdog hang. Surfaced on the WebUSB panel.
+ extern volatile uint16_t g_ringFault;
+diff --git a/OpenPuck/identity.cpp b/OpenPuck/identity.cpp
+index 8b2ba1e..630e5a6 100644
+--- a/OpenPuck/identity.cpp
++++ b/OpenPuck/identity.cpp
+@@ -7,13 +7,25 @@ char g_unit[16];
+ char g_board[16];
+ char g_usbSerial[18];
+ 
++#ifndef OPK_PUCK_FW_TS
++// Synced to Valve's current PROTEUS_FW_TS in Steam/bin/hardwareupdater/hardwareupdater.cfg
++// so Steam does not falsely nag to flash STM32 Proteus firmware onto the nRF52840 OpenPuck.
++#define OPK_PUCK_FW_TS 0x6AC6869Bu
++#endif
++
++#define OPK_U32_LE(v) \
++	(uint8_t)((v) & 0xFFu), \
++	(uint8_t)(((v) >> 8) & 0xFFu), \
++	(uint8_t)(((v) >> 16) & 0xFFu), \
++	(uint8_t)(((v) >> 24) & 0xFFu)
++
+ // clang-format off
+ const uint8_t ATTR83_PUCK[25] = { // 0x83 attributes
+ 	// 1 byte tag, 4 byte little-endian value.
+ 	0x01,  0x04, 0x13, 0x00, 0x00, 		// product_id = 0x1304
+ 	0x02,  0x00, 0x00, 0x00, 0x00, 		// capabilities = 0 (bitfield)
+ 	0x0A,  0xF2, 0xF9, 0xD2, 0x68,      // boot_build_timestamp = 0x68D2F9F2
+-	0x04,  0x59, 0x83, 0x62, 0x6A,      // build_timestamp = 0x6A628359 todo: keep updated
++	0x04,  OPK_U32_LE(OPK_PUCK_FW_TS),  // build_timestamp = OPK_PUCK_FW_TS (synced with PROTEUS_FW_TS)
+ 	0x09,  0x47, 0x00, 0x00, 0x00       // hw_id = 0x47
+ };
+ const uint8_t ATTR83_MACHINE[25] = { // 0x83 attributes
+@@ -21,7 +33,7 @@ const uint8_t ATTR83_MACHINE[25] = { // 0x83 attributes
+ 	0x01,  0x04, 0x13, 0x00, 0x00, 		// product_id = 0x1304. (same as the Puck, interestingly!)
+ 	0x02,  0x00, 0x00, 0x00, 0x00, 		// capabilities = 0 (bitfield)
+ 	0x0A,  0x01, 0x97, 0xCC, 0x68,      // boot_build_timestamp = 0x68CC9701
+-	0x04,  0x59, 0x83, 0x62, 0x6A,      // build_timestamp = 0x6A628359 todo: keep updated
++	0x04,  OPK_U32_LE(OPK_PUCK_FW_TS),  // build_timestamp = OPK_PUCK_FW_TS (synced with PROTEUS_FW_TS)
+ 	0x09,  0x44, 0x00, 0x00, 0x00       // hw_id = 0x44
+ };
+ // clang-format on
+diff --git a/OpenPuck/puck_hid.cpp b/OpenPuck/puck_hid.cpp
+index 5278607..9a21138 100644
+--- a/OpenPuck/puck_hid.cpp
++++ b/OpenPuck/puck_hid.cpp
+@@ -817,7 +817,7 @@ void SteamPuckController::onAuxReport(int slot, uint8_t rid,
+ 	// Forward the controller's status report VERBATIM (the real puck does this; it's how the host reads
+ 	// battery). Padding the report to the descriptor-declared length broke battery in both lizard and
+ 	// Steam, so it's reverted -- send exactly what the controller sent.
+-	if (g_slot[slot].used && hid[slot].ready()) {
++	if (g_slot[slot].used && USBDevice.mounted()) {
+ 		// capture the pushed status report (0x43 battery / 0x44) device->host for the WebUSB panel: this is
+ 		// the channel Steam actually reads battery from; marker 0xFB = "->host push".
+ 		hapLogAdd(0xFB, rid, data, n);
+@@ -947,7 +947,7 @@ void SteamPuckController::task()
+ 				// leaving gamepad-forward -> release held 0x45 buttons/sticks/triggers on every slot
+ 				static const uint8_t neutral45[45] = { 0 };
+ 				for (int s = 0; s < NSLOT; s++)
+-					if (g_slot[s].used && hid[s].ready())
++					if (g_slot[s].used && USBDevice.mounted())
+ 						usbTxHid(&hid[s], 0x45,
+ 							 neutral45,
+ 							 sizeof neutral45);
+@@ -964,7 +964,7 @@ void SteamPuckController::task()
+ 			     discEdgeMs[NSLOT] = { 0 }, last43[NSLOT] = { 0 },
+ 			     poHandled[NSLOT] = { 0 };
+ 	for (int s = 0; s < NSLOT; s++) {
+-		if (!g_slot[s].used || !hid[s].ready())
++		if (!g_slot[s].used || !USBDevice.mounted())
+ 			continue;
+ 		// Power-off just relayed to this slot -> force ONE clean disconnect to Steam now, regardless of the
+ 		// prior edge state. The controller's noisy shutdown (it keeps streaming F1 for ~1s after "off!") can
+@@ -1060,6 +1060,6 @@ void SteamPuckController::task()
+ 	}
+ 	// Reset edge state for slots that are no longer used/ready (so a re-bond sees a fresh edge).
+ 	for (int s = 0; s < NSLOT; s++)
+-		if (!g_slot[s].used || !hid[s].ready())
++		if (!g_slot[s].used || !USBDevice.mounted())
+ 			usbConn[s] = false;
+ }
+diff --git a/OpenPuck/rf_link.cpp b/OpenPuck/rf_link.cpp
+index 0c1b992..18375df 100644
+--- a/OpenPuck/rf_link.cpp
++++ b/OpenPuck/rf_link.cpp
+@@ -52,6 +52,18 @@ bool g_connVerbose = false;
+ // dropped the rate. FIXED + not configurable (like g_pollUs): there is no good reason to raise it in the
+ // field, and doing so silently starves the poll cycle. Any persisted/old value is ignored.
+ const uint32_t g_rxWin = 1200;
++// Dynamic RX timeout scaled to g_pollUs so a single missed reply never stalls past the poll frame budget:
++//   <= 1250 us (800-1000 Hz) -> 680 us (normal 58-66B 2Mbit F1 reply finishes EVENTS_END in ~360-400 us)
++//   <= 2200 us (500 Hz)      -> 950 us
++//   >  2200 us (250 Hz)      -> 1200 us
++uint16_t rfEffectivePollRxWinUs()
++{
++	if (g_pollUs <= 1250u)
++		return 680u;
++	if (g_pollUs <= 2200u)
++		return 950u;
++	return (uint16_t)g_rxWin;
++}
+ unsigned long g_connCooldown = 0;
+ 
+ uint8_t g_connSt = 0; // 0=announce awake, 1=poll loop
+@@ -484,11 +496,6 @@ int g_curSlot = -1;
+ // +4 per cycle = 0 mod 4, so each slot's GET PID is constant => the controller never dequeues => ~60 new/s
+ // instead of ~400. Each slot's counter increments once per poll-of-that-slot so it cycles 0,1,2,3 cleanly.
+ static uint8_t g_pollPid[NSLOT] = {};
+-// Relay PID is offset by 2 from poll PID so the two never share the same
+-// 2-bit PID value in the same cycle. Both counters advance once per cycle;
+-// starting 2 apart keeps them 2 apart (mod 4) forever, preventing the
+-// controller from deduplicating the E3 GET as a retransmit of the relay.
+-static uint8_t g_relayPid[NSLOT] = { 2, 2, 2, 2 };
+ // All link statistics are PER SLOT: each controller's polls/replies/errors are counted (and reported --
+ // serial stat line, WebUSB blob v13) against that controller only. The old scalar counters merged every
+ // slot into one number, so the panel couldn't tell "controller B is drowning" from "everything is slow".
+@@ -3324,11 +3331,24 @@ bool rfRecoveryRequestHop(uint8_t channel)
+ // no reply, so they don't burn a full ~1.2ms window of dead air per haptic. Per-slot: the connected poll runs
+ // on this slot's UNIQUE session address (one address per bonded controller); replies are demuxed by which
+ // address the controller answers on (each controller only hears its own).
++// Tracks whether the most recent rfConnTx() call actually decoded a type-6 (0x42/0x45/0x47) input report.
++// Used by 1000 Hz relay+poll coalescing so non-input ACKs (e.g. tag-2 immediate feature-query ACKs) never
++// suppress the cycle's bare E3 input poll.
++static bool g_lastTxDecodedInput = false;
++
++static inline uint8_t rfMakeS1(uint8_t pidv)
++{
++	return (g_e3mode == 1) ? (uint8_t)(((pidv & 3u) << 1) | 1u) :
++	       (g_e3mode == 2) ? (uint8_t)((pidv & 3u) << 1) :
++				 0x07u;
++}
++
+ uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t *payload, uint8_t plen,
+ 		 uint16_t rxWinUs)
+ {
+-	// relays pass a tiny window (no reply expected); polls use g_rxWin
+-	uint16_t win = rxWinUs ? rxWinUs : g_rxWin;
++	g_lastTxDecodedInput = false;
++	// relays pass an explicit window; polls use rfEffectivePollRxWinUs() scaled to g_pollUs
++	uint16_t win = rxWinUs ? rxWinUs : rfEffectivePollRxWinUs();
+ 	memset(rftx, 0, sizeof rftx);
+ 	rftx[0] = plen; // LENGTH = payload byte count
+ 	rftx[1] = s1; // S1 (type-specific)
+@@ -3765,6 +3785,7 @@ uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t *payload, uint8_t plen,
+ 								fresh, tlen);
+ 						lastRep = rep;
+ 						lastTlen = tlen;
++						g_lastTxDecodedInput = true;
+ 						if (fresh)
+ 							rfChannelNoteDecodedInput(
+ 								g_curSlot, bb);
+@@ -4000,6 +4021,21 @@ uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t *payload, uint8_t plen,
+ #define SLOT_QUIET_RETRY_MS 50u
+ static unsigned long g_slotLastAttemptMs[NSLOT] = {};
+ 
++// In 1-Controller mode, returns the bonded slot that was active within SLOT_QUIET_MS (2.5 s) and did not
++// explicitly power off, or -1 if none. Prevents brief >300 ms 2.4 GHz fades from triggering an every-loop
++// ch2 discovery storm or round-robining away from the recovering controller.
++static int findRecentSingleSlot(unsigned long nowMs)
++{
++	for (int s = 0; s < NSLOT; s++) {
++		if (g_slot[s].used && g_connReplyMs[s] != 0 &&
++		    !g_slotPoweredOff[s] &&
++		    (nowMs - g_connReplyMs[s]) < SLOT_QUIET_MS) {
++			return s;
++		}
++	}
++	return -1;
++}
++
+ // Drive the connected-mode sequence. The cycle gate fires once per g_pollUs (250 Hz); each fire
+ // polls EVERY warm slot back-to-back so all bonded controllers run at full rate regardless of count.
+ // "Cold" means the slot WAS connected but has been silent for > SLOT_COLD_MS; slots that have never
+@@ -4073,35 +4109,48 @@ static void rfConnStep()
+ 			rfConnTx(ch, 0x01, pa, 3, 600);
+ 		}
+ 		rfConnQueueHapticRelay();
+-		{
+-			uint8_t rs1 =
+-				(uint8_t)((((g_relayPid[k]++) & 3) << 1) | 1);
+-			if (rfConnFlushRelay(ch, rs1))
++		uint8_t relayRx = 0;
++		bool relayDecodedInput = false;
++		if (relayPending()) {
++			// Advance per-slot ESB PID ONLY when rfConnFlushRelay actually transmits on air,
++			// and respect g_e3mode so consecutive frames never collide mod 4.
++			uint8_t rs1 = rfMakeS1(g_pollPid[k]);
++			if (rfConnFlushRelay(ch, rs1, &relayRx)) {
++				g_pollPid[k]++;
+ 				g_stRelay[k]++;
++				relayDecodedInput = g_lastTxDecodedInput;
++			}
+ 		}
+-		// per-slot PID cycle so each bonded controller's polls stay distinct
+-		uint8_t pidv = g_pollPid[k]++;
+-		uint8_t s1 = (g_e3mode == 1) ?
+-				     (uint8_t)(((pidv & 3) << 1) | 1) :
+-			     (g_e3mode == 2) ? (uint8_t)((pidv & 3) << 1) :
+-					       0x07;
+-		uint8_t rx;
+-		if (g_pollGet) {
+-			// legacy: E3 + TLV [len=02][subtype=01 GET][id=0x45][param]
+-			uint8_t p[5] = { 0xE3, 0x02, 0x01, 0x45, g_getParam };
+-			rx = rfConnTx(ch, s1, p, 5);
++		uint8_t rx = 0;
++		if (relayDecodedInput && g_pollUs <= 1500u && !g_pollGet) {
++			// At >666 Hz (e.g. 1000 Hz = 1000 us), the E3 haptic relay TX already polled the controller
++			// and decoded a genuine type-6 (0x42/0x45/0x47) F1 input report for this 1 ms slice.
++			// Non-input ACKs (e.g. tag-2 immediate feature-query ACK for 0x83/0xAE/0xED, or F2/F3)
++			// keep relayDecodedInput=false so the bare E3 poll still runs immediately.
++			rx = relayRx;
+ 		} else {
+-			// real puck: BARE E3 (just the opcode) -- the controller streams F1 to any E3 ack
+-			uint8_t p[1] = { 0xE3 };
+-			rx = rfConnTx(ch, s1, p, 1);
+-			// One retransmit for a slot that was just replying: a
+-			// weak link loses replies, not the session. Skipped for
+-			// absent slots and when it would overrun the poll cycle.
+-			if (!rx && g_connReplyMs[k] &&
+-			    nowMs - g_connReplyMs[k] < 300u &&
+-			    (uint32_t)(micros() - nowUs) + g_rxWin + 700u <
+-				    (uint32_t)g_pollUs)
++			// per-slot PID cycle so each bonded controller's polls stay distinct
++			uint8_t s1 = rfMakeS1(g_pollPid[k]++);
++			if (g_pollGet) {
++				// legacy: E3 + TLV [len=02][subtype=01 GET][id=0x45][param]
++				uint8_t p[5] = { 0xE3, 0x02, 0x01, 0x45, g_getParam };
++				rx = rfConnTx(ch, s1, p, 5);
++			} else {
++				// real puck: BARE E3 (just the opcode) -- the controller streams F1 to any E3 ack
++				uint8_t p[1] = { 0xE3 };
+ 				rx = rfConnTx(ch, s1, p, 1);
++				// One retransmit for a slot that was just replying: a
++				// weak link loses replies, not the session. Skipped for
++				// absent slots and when it would overrun the poll cycle.
++				const uint32_t effWin = rfEffectivePollRxWinUs();
++				if (!rx && g_connReplyMs[k] &&
++				    nowMs - g_connReplyMs[k] < 300u &&
++				    (uint32_t)(micros() - nowUs) + effWin + 500u <
++					    (uint32_t)g_pollUs) {
++					uint8_t s1r = rfMakeS1(g_pollPid[k]++);
++					rx = rfConnTx(ch, s1r, p, 1);
++				}
++			}
+ 		}
+ 		if (rx)
+ 			g_chF1[0]++;
+@@ -4111,33 +4160,38 @@ static void rfConnStep()
+ 
+ 	bool linkUp = anySlotLinkUp();
+ 	if (!linkUp) {
+-		// (RE)ACQUIRE MODE -- nothing is linked. Poll used slots to catch a (re)connecting controller fast,
+-		// but ROUND-ROBIN: exactly ONE slot per cycle, so radio duty stays bounded to a single ~g_rxWin no-reply
+-		// wait per cycle no matter how many bonds are absent.
+-		//
+-		// Why not poll every absent slot per cycle: doing so was the fix for the solid-light reconnect livelock
+-		// (a slot silent > SLOT_COLD_MS had dropped to a 2s poll that kept missing the controller's re-adopt
+-		// window), BUT with two bonds absent it put TWO full ~g_rxWin no-reply waits + the every-loop beaconing
+-		// on every cycle -- a radio-duty spike that starved loop()/USB into a watchdog reset. The puck then
+-		// re-enumerated on every disconnect, so Steam saw a "new controller" and popped its setup wizard every
+-		// time. One slot per cycle keeps acquire snappy (N bonds => each polled at 250/N Hz, still far faster
+-		// than the old 2s cold cadence) while capping duty. A single used slot is still polled every cycle.
+-		static int acqIdx = 0;
+-		for (int n = 0; n < NSLOT; n++) {
+-			int k = (acqIdx + n) % NSLOT;
+-			if (g_slot[k].used) {
+-				acqIdx = (k + 1) % NSLOT;
++		int fadingSlot = (g_singleCtrlMode && !g_pairing) ?
++					 findRecentSingleSlot(nowMs) :
++					 -1;
++		if (fadingSlot >= 0) {
++			// Brief <2.5s fade in 1-controller mode: keep 100% of reacquire polls on the active slot.
++			doPoll(fadingSlot);
++		} else {
++			// (RE)ACQUIRE MODE -- nothing is linked. Poll used slots to catch a (re)connecting controller fast,
++			// but ROUND-ROBIN: exactly ONE slot per cycle, so radio duty stays bounded to a single ~g_rxWin no-reply
++			// wait per cycle no matter how many bonds are absent.
++			static int acqIdx = 0;
++			for (int n = 0; n < NSLOT; n++) {
++				int k = (acqIdx + n) % NSLOT;
++				if (g_slot[k].used) {
++					acqIdx = (k + 1) % NSLOT;
++					doPoll(k);
++					break;
++				}
++			}
++		}
++	} else if (g_singleCtrlMode && !g_pairing) {
++		// 1-CONTROLLER HIGH-REFRESH-RATE MODE: dedicate 100% of connected poll cycles to the single live
++		// controller; never burn RX windows probing offline/stale bonds on other slots while live.
++		for (int k = 0; k < NSLOT; k++) {
++			if (g_slot[k].used && g_connReplyMs[k] != 0 &&
++			    (nowMs - g_connReplyMs[k]) < 300u) {
+ 				doPoll(k);
+ 				break;
+ 			}
+ 		}
+ 	} else {
+-		// CONNECTED -- at least one controller is live. Poll every WARM slot per cycle (all bonded controllers
+-		// at full rate -- the real puck services them all per cycle), and throttle the SILENT ones so they don't
+-		// steal reply windows from the live controller(s) (the issue-#72 radio-duty concern):
+-		//   - "cold": WAS connected but silent > SLOT_COLD_MS (controller powered off / out of range);
+-		//   - "quiet": briefly silent (fade) -> back off to SLOT_QUIET_RETRY_MS until it recovers or goes cold;
+-		//   - "phantom": NEVER replied while another controller is live (e.g. a stale bond from a cloned backup).
++		// MULTI-CONTROLLER MODE -- poll every WARM slot per cycle and throttle silent ones:
+ 		for (int k = 0; k < NSLOT; k++) {
+ 			if (!g_slot[k].used)
+ 				continue;
+@@ -4168,8 +4222,7 @@ void rfLinkTask()
+ 		return;
+ 	rfStartupChannelTask();
+ 	// Poll before beacons: the cycle gate must fire as close to its
+-	// 4 ms deadline as possible; beacon TX (up to 3.6 ms for 4 slots)
+-	// runs after so it never delays the current poll.
++	// deadline as possible; beacon TX runs after so it never delays the current poll.
+ 	if (g_connOn && millis() - g_connCooldown > 2500) {
+ 		rfConnStep();
+ 	} // connected-mode: poll controller, read input
+@@ -4180,25 +4233,37 @@ void rfLinkTask()
+ 	// that's powering off isn't immediately re-woken/reconnected.
+ 	if (g_rfHost && millis() - g_connCooldown > 2500) {
+ 		bool connNow = anySlotLinkUp();
+-		// session keepalive on the clean channel: every loop while connecting (fast), every 25ms once connected
+-		// (every-loop beaconing also hammers the session ch and steals reply slots from the poll). The real puck
+-		// sends NO E1 on its session channel; gated by g_e1keepalive ('m') so this can be A/B'd on hardware --
+-		// but it stays ON by default because OpenPuck's shared-address model relies on E1 to advertise the session.
++		unsigned long nowBcnMs = millis();
++		int fadingSlot = (!connNow && g_singleCtrlMode && !g_pairing) ?
++					 findRecentSingleSlot(nowBcnMs) :
++					 -1;
++		unsigned long sessBcnPeriod = connNow ? 25u : (fadingSlot >= 0 ? 15u : 0u);
+ 		if (g_e1keepalive &&
+-		    millis() - g_lastSessBeacon >= (connNow ? 25u : 0u)) {
+-			g_lastSessBeacon = millis();
++		    nowBcnMs - g_lastSessBeacon >= sessBcnPeriod) {
++			g_lastSessBeacon = nowBcnMs;
+ 			g_rfCh = g_sessCh;
+-			for (int s = 0; s < NSLOT; s++)
+-				rfHostFrameOnce(s, false);
++			if (fadingSlot >= 0) {
++				rfHostFrameOnce(fadingSlot, false);
++			} else {
++				for (int s = 0; s < NSLOT; s++) {
++					if (connNow && g_singleCtrlMode && !g_pairing) {
++						if (!(g_slot[s].used && g_connReplyMs[s] &&
++						      (nowBcnMs - g_connReplyMs[s]) < 300u))
++							continue;
++						rfHostFrameOnce(s, false);
++						break;
++					}
++					rfHostFrameOnce(s, false);
++				}
++			}
+ 		}
+-		// discovery beacon on ch2 (where a searching controller looks): every loop when nothing is
+-		// connected (fastest cold-boot/late-joiner connect), every 200ms once ANY controller is linked.
+-		// Matches main: while a slot is connected, ch2 discovery shares g_sessCh's air budget, so beaconing
+-		// faster than 200ms (the old allUp-gated 40ms path) just steals reply windows from the connected
+-		// controller -> reply-rate sag -> >1500ms gaps -> spurious hapticOnReconnect re-init. A late joiner
+-		// still enumerates within ~1s at 200ms.
+-		if (millis() - g_lastDisc >= (connNow ? 200u : 0u)) {
+-			g_lastDisc = millis();
++		// In 1-Controller High-Refresh-Rate mode, skip ch2 discovery completely while our 1 controller is
++		// connected (unless pairing 0xAD is active), and throttle ch2 discovery to 250 ms during brief
++		// <2.5 s fades so ch2 never starves g_sessCh recovery!
++		bool wantDisc = !connNow || !g_singleCtrlMode || g_pairing;
++		unsigned long discPeriod = connNow ? 200u : (fadingSlot >= 0 ? 250u : 0u);
++		if (wantDisc && nowBcnMs - g_lastDisc >= discPeriod) {
++			g_lastDisc = nowBcnMs;
+ 			g_rfCh = 2;
+ 			for (int s = 0; s < NSLOT; s++)
+ 				rfHostFrameOnce(s, true);
+diff --git a/OpenPuck/rf_link.h b/OpenPuck/rf_link.h
+index 552a596..44dde67 100644
+--- a/OpenPuck/rf_link.h
++++ b/OpenPuck/rf_link.h
+@@ -43,10 +43,10 @@ extern bool
+ 
+ // full multi-line debug dump vs compact "I45 <hex>" stream
+ extern bool g_connVerbose;
+-// poll RX-window (us): the full window is paid only on a no-reply poll (a reply returns early), so it must
+-// stay < g_pollUs to fit inside the 250 Hz cycle. FIXED, not configurable (like g_pollUs) -- raising it
+-// starves the poll cycle, so it's pinned rather than exposed as a footgun knob.
++// poll RX-window (us): dynamically scaled below g_pollUs via rfEffectivePollRxWinUs() so a missed reply
++// never overruns a 1000 Hz (1000 us) or 500 Hz (2000 us) frame budget.
+ extern const uint32_t g_rxWin;
++uint16_t rfEffectivePollRxWinUs();
+ 
+ // set on 0xF2 disconnect; pauses beacon+poll so a powering-off controller can sleep
+ extern unsigned long g_connCooldown;
+diff --git a/OpenPuck/serial_console.cpp b/OpenPuck/serial_console.cpp
+index 052cf6d..5e00d2e 100644
+--- a/OpenPuck/serial_console.cpp
++++ b/OpenPuck/serial_console.cpp
+@@ -38,9 +38,11 @@ void serialConsolePoll()
+ 			} else if (!strcmp(line, "CD")) {
+ 				// A/B: content dedup on the Steam input forward (drop reports whose body minus the
+ 				// free-running counter is unchanged) -- caps delivered rate at the controller's real
+-				// distinct-report rate instead of the poll rate.
++				// distinct-report rate instead of the poll rate. Persisted in cfgExt[6].
+ 				g_fwdContentDedup = !g_fwdContentDedup;
+-				Serial.printf("# content dedup %s\n",
++				cfgExtWrite(6u, g_fwdContentDedup ? 1u : 0u);
++				saveCfg();
++				Serial.printf("# content dedup %s [persisted]\n",
+ 					      g_fwdContentDedup ? "ON" : "off");
+ 			} else if (!strcmp(line, "SS")) {
+ 				// on-demand smoothness snapshot: print the last-second cached rates in ONE line, NOW,
+@@ -53,17 +55,25 @@ void serialConsolePoll()
+ 					g_norxps, g_curSlot);
+ 			} else if (!strncmp(line, "PR", 2) &&
+ 				   (line[2] >= '0' && line[2] <= '9')) {
+-				// live poll-rate sweep: "PR<hz>" sets the RF poll cadence (session-only, not persisted).
+-				// Clamped 100..1000 Hz. Watch the delivered report rate / feel to find the sweet spot.
++				// live + persisted poll-rate control: "PR<hz>" sets the RF poll cadence (100..1000 Hz).
+ 				long hz = atol(line + 2);
+ 				if (hz < 100)
+ 					hz = 100;
+ 				else if (hz > 1000)
+ 					hz = 1000;
+-				g_pollUs = (uint32_t)(1000000L / hz);
++				persistCustomPollUs((uint32_t)(1000000L / hz));
++				Serial.printf(
++					"# poll rate -> %ld Hz (%lu us, rxWin=%u us) [persisted]\n",
++					hz, (unsigned long)g_pollUs,
++					(unsigned)rfEffectivePollRxWinUs());
++			} else if (!strcmp(line, "SC")) {
++				// toggle 1-Controller Exclusive RF Air-Time mode (persisted in cfgExt[5])
++				g_singleCtrlMode = !g_singleCtrlMode;
++				cfgExtWrite(5u, g_singleCtrlMode ? 1u : 0u);
++				saveCfg();
+ 				Serial.printf(
+-					"# poll rate -> %ld Hz (%lu us)\n", hz,
+-					(unsigned long)g_pollUs);
++					"# single-controller RF mode %s\n",
++					g_singleCtrlMode ? "ON" : "off");
+ 			} else if (!strcmp(line, "SO")) {
+ 				// toggle the autonomous controller power-off on host sleep. Off = the controller
+ 				// stays awake through host sleep, keeping its short-Steam-press remote wakeup
+diff --git a/OpenPuck/usb_tx.cpp b/OpenPuck/usb_tx.cpp
+index 1c83a7c..0ea2e23 100644
+--- a/OpenPuck/usb_tx.cpp
++++ b/OpenPuck/usb_tx.cpp
+@@ -10,7 +10,7 @@
+ // usbtx task AND tud_hid_report_complete_cb, serialized by a guard flag inside usbTxDrain.
+ #define TX_CHAN_MAX 8
+ #define TX_RING_N \
+-	4 // depth per destination; 250 Hz produced, ~1 kHz SOF drain -> stays shallow
++	16 // depth per destination; absorbs 1000 Hz input + interleaved 0x43/0x7B status reports without eviction
+ #define TX_DATA_MAX \
+ 	64 // CFG_TUD_HID_EP_BUFSIZE -- the largest report any mode sends (63 B + id)
+ 
+diff --git a/OpenPuck/webusb_config.cpp b/OpenPuck/webusb_config.cpp
+index e06a56b..95a62ae 100644
+--- a/OpenPuck/webusb_config.cpp
++++ b/OpenPuck/webusb_config.cpp
+@@ -259,7 +259,7 @@ static void webusbSendBlob()
+ 	p[115] = (uint8_t)(rr >> 24);
+ 	// Connection tunables (protocol v11): poll RX window in 10us units, post-connect haptic block enable,
+ 	// and block duration in seconds.
+-	p[116] = (uint8_t)(g_rxWin / 10);
++	p[116] = (uint8_t)(rfEffectivePollRxWinUs() / 10u);
+ 	p[117] = g_hapticBlockOn;
+ 	p[118] = (uint8_t)(g_hapticBlockMs / 1000);
+ 	// RF wedge diagnostics (always populated, even when the link reads down): CRC-fail/s and no-reply/s,
+@@ -1155,7 +1155,13 @@ void webusbPoll()
+ 						applyActiveType();
+ 					}
+ 					break;
+-				// case 9 (pollU100) removed -- poll rate is fixed at POLL_US_DEFAULT and no longer configurable.
++				// Poll cadence in 100 us units (10 = 1000 Hz, 20 = 500 Hz, 40 = 250 Hz); persisted via cfgExt[3..4].
++				case 9: {
++					uint8_t u100 = v < 10u ? 10u : (v > 100u ? 100u : v);
++					persistCustomPollUs((uint32_t)u100 * 100u);
++					persist = false;
++					break;
++				}
+ 
+ 				// E7 protocol-version B-byte (experimental v1 fast)
+ 				case 10:
+@@ -1326,6 +1332,18 @@ void webusbPoll()
+ 				case 29:
+ 					g_isMachineInternal = v ? 0xEE : 0;
+ 					break;
++
++				// Content dedup on Steam 0x42/0x45/0x47 input forward (persisted in cfgExt[6]).
++				case 30:
++					g_fwdContentDedup = v ? 1u : 0u;
++					cfgExtWrite(6u, g_fwdContentDedup);
++					break;
++
++				// 1-Controller Exclusive RF Air-Time mode (persisted in cfgExt[5]).
++				case 31:
++					g_singleCtrlMode = (v != 0);
++					cfgExtWrite(5u, g_singleCtrlMode ? 1u : 0u);
++					break;
+ 				}
+ 				if (persist)
+ 					saveCfg();
