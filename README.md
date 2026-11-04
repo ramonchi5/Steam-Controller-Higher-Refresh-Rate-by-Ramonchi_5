@@ -28,9 +28,9 @@ By default, a wireless 2nd-Gen Steam Controller is bottlenecked at three layers:
 
 In fast action games requiring **frame-perfect inputs at 60 FPS** (`16.67 ms` per frame — such as frame-perfect jumps/deflects in *Sekiro*), a `4.0 ms` wireless polling interval means an input pressed near the end of a frame has up to a **24% chance (`4.0 / 16.67`)** of "missing the bus" and landing on the next frame.
 
-### Why Our 1000 Hz Poll Delivers `~750 Hz` of True Controller Frames (Zero Fake Duplicates!)
+### Why Our 1000 Hz Poll Delivers `~750–800 Hz` of True Controller Frames (Zero Fake Duplicates!)
 - Our firmware configures the nRF52840 dongle to poll the Steam Controller over 2.4 GHz Enhanced ShockBurst (ESB) at **1000 Hz (`1000 us`)** and stream over USB at **1000 Hz (`bInterval = 1 ms`)**.
-- Inside the Steam Controller itself, Valve's internal sensor/ADC firmware generates new input state packets at a hardware ceiling of roughly **`~750–845 Hz`**.
+- **Hardware Ceiling Proof:** Every `0x42` packet carries the Steam Controller's own internal 8-bit hardware report counter (`rep[1]`). Live captures prove that Valve's internal sensor/ADC loop inside the wireless controller ticks at a fixed **`~845 Hz` (`~1.183 ms` per report)** — when polled at `1000 Hz`, the controller replies with a fresh `0xF1` report `~750–800` times/sec and a `0`-byte empty ESB ACK on the remaining `~200` polls/sec where no new sample has been generated yet.
 - **No Fake Padding:** Rather than padding repeated packets up to 1000 Hz (which corrupts Steam Input's gyro/trackpad velocity integration and makes mouse-like gyro feel stuttery), our firmware preserves OpenPuck's on-board **byte-level content deduplicator** (`g_fwdContentDedup`) and fixes a high-rate USB `0x79` slot-theft bug in [`puck_hid.cpp`](firmware/openpuck-highrate/OpenPuck/puck_hid.cpp).
 - **Verified Result:** Every single one of the **`~750 Hz` (`1.006 ms` median, `1.33 ms` average)** `0x42` input reports delivered to Windows contains a **genuinely new 16-bit ADC / sensor sample (`0%` duplicate frames)** — cutting worst-case wireless sampling delay by **3×** (`4.0 ms -> ~1.33 ms`) while keeping **Gyro, Trackpads, Haptics, Battery %, and OBS Gamepad Viewer working identically to the official Valve Puck**.
 
@@ -111,14 +111,15 @@ If you only want to use the dongle and do not want any files or background tools
      ```vdf
      "SteamController_Poll_Rate"		"1"
      ```
-   - If it does not exist yet, find the `"System"` block (or `"controller_settings"` block) inside `localconfig.vdf` and add:
+   - If it does not exist yet, scroll to the **very bottom** of `localconfig.vdf` and add it as a **root-level key inside `"UserLocalConfigStore"`**, directly above the final closing `}` of the file *(do NOT nest it inside `"System"` or `"controller_settings"` — `steamclient64.dll` reads `"SteamController_Poll_Rate"` strictly from the root of `"UserLocalConfigStore"`)*:
      ```vdf
-     "SteamController_Poll_Rate"		"1"
+     	"SteamController_Poll_Rate"		"1"
+     }
      ```
 5. Save `localconfig.vdf` and launch Steam. *(You can also add `+controller_rate 1000` to your Steam shortcut target as an extra guarantee.)*
 
 ### Method B: Automated 1-Click Windows Suite (`Enable-Persistent-1000Hz.cmd`)
-If you are on Windows 10/11 and want both **1000 Hz Steam Input** and **0.500 ms Windows Kernel Timer + Anti-EcoQoS Priority Boosting** (requires [.NET 10 SDK/Runtime](https://dotnet.microsoft.com/download)):
+If you are on Windows 10/11 and want both **1000 Hz Steam Input** and **0.500 ms Windows Kernel Timer + Anti-EcoQoS Priority Boosting** *(zero dependencies needed if using the **GitHub Release `.zip`**; requires [.NET 10 SDK](https://dotnet.microsoft.com/download) only if building from source)*:
 
 1. Double-click **[`Enable-Persistent-1000Hz.cmd`](Enable-Persistent-1000Hz.cmd)** in the repository root.
 2. This automatically:
@@ -138,9 +139,9 @@ Hold **all 4 back paddles (`L4 + R4 + L5 + R5`)** plus a face button at any time
 | Button Combo | Mode | Details |
 | :--- | :--- | :--- |
 | **`L4 + R4 + L5 + R5 + A`** | **Steam Controller Mode** *(Default)* | Native `28DE:1304` Steam Controller Puck (`~750 Hz` genuine wireless frames, full Steam Input, Gyro, Trackpads, Paddles, Haptics, Battery). |
-| **`L4 + R4 + L5 + R5 + B`** | **Lizard Mode** | Hardware mouse + keyboard desktop mode (works even in Windows UAC prompts, Task Manager, or when Steam is closed). |
-| **`L4 + R4 + L5 + R5 + X`** | **Xbox 360 Mode** | Presents a wired XInput / Xbox 360 controller for PC Game Pass or non-Steam games. |
-| **`L4 + R4 + L5 + R5 + Y`** | **Nintendo Switch / Switch 2 Pro Controller** | Emulates an official **Nintendo Switch Pro Controller (`057E:2009`)** with **full Gyro + HD Rumble/Haptics + configurable back paddles**. |
+| **`L4 + R4 + L5 + R5 + B`** | **Lizard Mode** | Hardware mouse + keyboard desktop mode (works even in Windows UAC prompts, Task Manager, or when Steam is closed; not a gamepad device). |
+| **`L4 + R4 + L5 + R5 + X`** | **Xbox 360 Mode** | Native `045E:028E` XInput / Xbox 360 controller (`1 ms` USB `bInterval`, **`~750 Hz`** genuine wireless frames) for PC Game Pass, non-Steam games, or XInput polling testers. *(Return to Steam mode anytime with `L4 + R4 + L5 + R5 + A` or by replugging the dongle.)* |
+| **`L4 + R4 + L5 + R5 + Y`** | **Nintendo Switch / Switch 2 Pro Controller** | Emulates an official **Nintendo Switch Pro Controller (`057E:2009`)** at `250 Hz` (`4 ms`) USB cadence with **full Gyro + HD Rumble/Haptics + configurable back paddles**. |
 
 *(Additional modes — **PS5 DualSense**, **PS4 DualShock 4**, **PS3 Sixaxis**, **Original Xbox**, **DirectInput Dual-Joystick**, and **SInput SDL3** — can be selected anytime via the browser-based [OpenPuck WebUSB Configurator](https://safijari.github.io/openpuck/) while in Steam mode.)*
 
@@ -168,6 +169,10 @@ Reports   : 3731 total (3725 Triton state 0x42/0x45/0x47, 6 aux status 0x43/0x79
   -> State Frame Timing (ms)    : min=0.028 | p50=1.006 | avg=1.340 | p95=2.036 | p99=3.010 | max=4.370 | jitter(sd)=0.531
 ```
 
+* **Third-Party Polling Testers (Gamepadla `Polling 2.exe` v2.0.2.6 Verified Results):**
+  * **Steam Mode (`Steam Direct`):** **`772.84 Hz` Average / `994.04 Hz` Median** (`1.01 ms` median interval, `1.29 ms` average interval, `0.50 ms` jitter). *(Keep **Steam running** in the background while testing so the Puck stays in gamepad mode rather than falling back to desktop Lizard mouse/keyboard mode.)*
+  * **Xbox Mode (`L4 + R4 + L5 + R5 + X`):** **`751.72 Hz` Average / `975.61 Hz` Median** (`1.02 ms` median interval, `1.33 ms` average interval, `0.50 ms` jitter — works with Steam open or closed).
+  * **Switch Mode (`L4 + R4 + L5 + R5 + Y`):** **`256.79 Hz` Average / `250.06 Hz` Median** (`4.00 ms` median interval, `0.41 ms` jitter — intentionally outputs at `250 Hz` USB cadence so Nintendo Switch / Switch 2 3-sample gyro integration remains drift-free while still sampling RF at `1000 Hz`).
 * **2.4 GHz Wireless Mouse Coexistence:** Tested live alongside a 2.4 GHz wireless gaming mouse dongle (`VXE R1`) with **`0` CRC errors/sec** and automatic clean channel selection.
 
 ---

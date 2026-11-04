@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using Microsoft.Win32;
+using SteamControllerRefreshRate.Native;
 
 namespace SteamControllerRefreshRate.Boost;
 
@@ -90,20 +91,29 @@ public static class StartupRegistrationService
             key.SetValue(RunValueName, commandValue, RegistryValueKind.String);
         }
 
-        if (!LowLatencyBooster.IsBoosterRunning(out int? existingPid))
+        // Always stop any running instance first so updating or relocating the folder
+        // immediately runs the newly registered executable and unlocks any old directory.
+        if (LowLatencyBooster.IsBoosterRunning(out _))
         {
-            StartDetachedProcess(agentExe, string.Empty, Path.GetDirectoryName(agentExe)!);
+            await LowLatencyBooster.StopRunningBoosterAsync(TimeSpan.FromSeconds(3), restoreNormalSteamPriority: false);
+        }
 
-            var sw = Stopwatch.StartNew();
-            while (sw.Elapsed < TimeSpan.FromSeconds(3))
+        StartDetachedProcess(agentExe, string.Empty, Path.GetDirectoryName(agentExe)!);
+
+        int? existingPid = null;
+        var sw = Stopwatch.StartNew();
+        while (sw.Elapsed < TimeSpan.FromSeconds(3))
+        {
+            if (LowLatencyBooster.IsBoosterRunning(out existingPid))
             {
-                if (LowLatencyBooster.IsBoosterRunning(out existingPid))
+                if (!WindowsSchedulerNative.TryQueryTimerResolutionMs(out _, out double minMs, out double curMs) ||
+                    curMs <= minMs + 0.05)
                 {
                     break;
                 }
-
-                await Task.Delay(100);
             }
+
+            await Task.Delay(100);
         }
 
         string pidNote = existingPid.HasValue ? $"PID {existingPid.Value}" : "active";

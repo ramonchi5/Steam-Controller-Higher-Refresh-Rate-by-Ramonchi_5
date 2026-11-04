@@ -63,6 +63,24 @@ function Build-MdkVariant {
 
     try {
         $puckFwTsHex = "6AC6869B"
+        try {
+            $steamCandidates = @()
+            $regSteam = (Get-ItemProperty -Path "HKCU:\Software\Valve\Steam" -Name "SteamPath" -ErrorAction SilentlyContinue).SteamPath
+            if ($regSteam) { $steamCandidates += ($regSteam -replace '/', '\') }
+            $steamCandidates += @("C:\Program Files (x86)\Steam", "C:\Program Files\Steam")
+            foreach ($sp in $steamCandidates) {
+                $hwCfg = Join-Path $sp "bin\hardwareupdater\hardwareupdater.cfg"
+                if (Test-Path $hwCfg) {
+                    foreach ($line in [System.IO.File]::ReadAllLines($hwCfg)) {
+                        if ($line -match '^PROTEUS_FW_TS:([0-9A-Fa-f]{8})\s*$') {
+                            $puckFwTsHex = $Matches[1].ToUpperInvariant()
+                            break
+                        }
+                    }
+                    break
+                }
+            }
+        } catch {}
         $linkFlags = "-Wl,--wrap=tud_vendor_control_xfer_cb -Wl,--wrap=tud_descriptor_string_cb -Wl,--wrap=usbd_control_xfer_cb -Wl,--section-start=.rf_journal_guard=0x86000"
         $extraFlags = "-DNRF52840_XXAA {build.flags.usb} -DCFG_TUD_HID=6 -DCFG_TUD_TASK_QUEUE_SZ=512 -DCFG_TUD_VENDOR_TX_BUFSIZE=256 -DOPK_RF_JOURNAL_BASE=0x86000 -DOPK_PUCK_FW_TS=0x${puckFwTsHex}u -DOPK_BOARD_MDK_USB_DONGLE=1 -DPOLL_US_DEFAULT=${PollUs}u"
 

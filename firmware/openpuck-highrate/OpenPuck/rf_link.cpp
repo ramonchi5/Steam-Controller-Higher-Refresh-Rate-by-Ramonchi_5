@@ -560,8 +560,10 @@ static void rfHostFrameOnce(int slot, bool discovery)
 	memset(rftx, 0, sizeof rftx);
 	// LENGTH = 18 (controller's buf[0]==0x12 check validates this)
 	rftx[0] = 0x12;
-	// S1 = PID<<1 | noack0  (matches real puck 00/02/04/06)
-	rftx[1] = (uint8_t)((g_pid++ & 3) << 1);
+	// S1 = PID<<1 | noack0  (matches real puck 00/02/04/06). On the per-slot session pipe (!discovery),
+	// advance g_pollPid[slot] so a session E1 keepalive never collides mod-4 with the next E3 poll's PID.
+	uint8_t pidSrc = discovery ? g_pid++ : g_pollPid[slot]++;
+	rftx[1] = (uint8_t)((pidSrc & 3u) << 1);
 	rftx[2] = 0xE1; // payload[0] marker
 	// payload[1..5] proteus_uuid (LE, as bonded)
 	memcpy(rftx + 3, rec + 0, 4);
@@ -3335,6 +3337,10 @@ bool rfRecoveryRequestHop(uint8_t channel)
 // Used by 1000 Hz relay+poll coalescing so non-input ACKs (e.g. tag-2 immediate feature-query ACKs) never
 // suppress the cycle's bare E3 input poll.
 static bool g_lastTxDecodedInput = false;
+// Tracks whether rfConnTx() received any CRC-valid ESB packet (including 0-byte empty ACKs when polling
+// faster than the controller's ~845 Hz internal report tick) so RF QoS / startup channel persistence and
+// in-cycle retransmits never mistake a healthy empty ACK for a lost RF poll.
+static bool g_lastTxGotValidAck = false;
 
 static inline uint8_t rfMakeS1(uint8_t pidv)
 {
@@ -3347,6 +3353,7 @@ uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t *payload, uint8_t plen,
 		 uint16_t rxWinUs)
 {
 	g_lastTxDecodedInput = false;
+	g_lastTxGotValidAck = false;
 	// relays pass an explicit window; polls use rfEffectivePollRxWinUs() scaled to g_pollUs
 	uint16_t win = rxWinUs ? rxWinUs : rfEffectivePollRxWinUs();
 	memset(rftx, 0, sizeof rftx);
@@ -3386,6 +3393,8 @@ uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t *payload, uint8_t plen,
 		if (!crcok) {
 			g_stCrc[slot]++;
 			g_qosBad++;
+		} else if (rxlen <= 96) {
+			g_lastTxGotValidAck = true;
 		}
 		// F1 input ~46B; 0x43-augmented ~66B -> allow up to MAXLEN(96)
 		if (crcok && rxlen && rxlen <= 96) {
@@ -4000,7 +4009,7 @@ uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t *payload, uint8_t plen,
 	RWAIT_DISABLED();
 	NRF_RADIO->EVENTS_DISABLED = 0;
 	if (plen && payload[0] == 0xE3 && g_curSlot >= 0 && g_curSlot < NSLOT)
-		rfLinkQualityNotePoll(g_curSlot, rxlen != 0);
+		rfLinkQualityNotePoll(g_curSlot, g_lastTxGotValidAck);
 	return rxlen;
 }
 
@@ -4143,7 +4152,7 @@ static void rfConnStep()
 				// weak link loses replies, not the session. Skipped for
 				// absent slots and when it would overrun the poll cycle.
 				const uint32_t effWin = rfEffectivePollRxWinUs();
-				if (!rx && g_connReplyMs[k] &&
+				if (!rx && !g_lastTxGotValidAck && g_connReplyMs[k] &&
 				    nowMs - g_connReplyMs[k] < 300u &&
 				    (uint32_t)(micros() - nowUs) + effWin + 500u <
 					    (uint32_t)g_pollUs) {

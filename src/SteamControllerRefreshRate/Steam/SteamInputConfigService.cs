@@ -295,10 +295,12 @@ public static class SteamInputConfigService
 
     public static int? TryReadPollRateMs(string vdfContent)
     {
+        // steamclient64.dll reads IClientConfigStore::GetInt(k_EConfigStoreUserLocal, "SteamController_Poll_Rate", 2)
+        // strictly from the root of "UserLocalConfigStore" (single-tab indent at depth 1).
         var match = Regex.Match(
             vdfContent,
-            $"\"{Regex.Escape(PollRateVdfKey)}\"\\s+\"(-?\\d+)\"",
-            RegexOptions.CultureInvariant);
+            $"^\\t\"{Regex.Escape(PollRateVdfKey)}\"\\s+\"(-?\\d+)\"\\s*\\r?$",
+            RegexOptions.Multiline | RegexOptions.CultureInvariant);
 
         if (match.Success && int.TryParse(match.Groups[1].Value, out int val))
         {
@@ -310,25 +312,29 @@ public static class SteamInputConfigService
 
     private static string UpsertRootKeyInUserLocalConfigStore(string vdfContent, string key, string value)
     {
-        string pattern = $"(\"{Regex.Escape(key)}\"\\s+\")(-?\\d+)(\")";
-        if (Regex.IsMatch(vdfContent, pattern, RegexOptions.CultureInvariant))
+        // Remove any accidentally nested duplicates (depth >= 2 tabs, e.g. inside "System") so only the valid root key remains
+        string nestedPattern = $"^\\t{{2,}}\"{Regex.Escape(key)}\"\\s+\"[^\"]*\"\\s*\\r?\\n";
+        string cleaned = Regex.Replace(vdfContent, nestedPattern, string.Empty, RegexOptions.Multiline | RegexOptions.CultureInvariant);
+
+        string rootPattern = $"^(\\t\"{Regex.Escape(key)}\"\\s+\")(-?\\d+)(\"\\s*\\r?)$";
+        if (Regex.IsMatch(cleaned, rootPattern, RegexOptions.Multiline | RegexOptions.CultureInvariant))
         {
             return Regex.Replace(
-                vdfContent,
-                pattern,
+                cleaned,
+                rootPattern,
                 m => $"{m.Groups[1].Value}{value}{m.Groups[3].Value}",
-                RegexOptions.CultureInvariant);
+                RegexOptions.Multiline | RegexOptions.CultureInvariant);
         }
 
         // Insert as a top-level key inside "UserLocalConfigStore" { ... } right before the final closing brace
-        string newline = vdfContent.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
-        int lastBrace = vdfContent.LastIndexOf('}');
+        string newline = cleaned.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        int lastBrace = cleaned.LastIndexOf('}');
         if (lastBrace < 0)
         {
             throw new InvalidOperationException("Malformed localconfig.vdf: missing closing brace.");
         }
 
         string entry = $"\t\"{key}\"\t\t\"{value}\"{newline}";
-        return vdfContent.Insert(lastBrace, entry);
+        return cleaned.Insert(lastBrace, entry);
     }
 }

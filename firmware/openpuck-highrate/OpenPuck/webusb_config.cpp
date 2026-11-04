@@ -957,6 +957,7 @@ void webusbPoll()
 						// see puck_hid 0xA2: never hand a stale queue to a new bond
 						if (!wasUsed)
 							relayClearSlot(slot);
+						evictDuplicateSerialBonds(slot);
 					} else {
 						memset(g_slot[slot].rec, 0, 24);
 						g_slot[slot].used = false;

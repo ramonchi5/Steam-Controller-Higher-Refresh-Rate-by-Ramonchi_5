@@ -315,7 +315,7 @@ static void handleSet(int slot, uint8_t rid, hid_report_type_t type,
 	// Disable lizard if requested by host.
 	if (cmd == IBEX_CMD_SET_SETTINGS_VALUES) {
 		// Host sent a settings write. Check if this is a write with the lizard suppression tag.
-		for (int off = 0; off <= len; off += 3) {
+		for (int off = 0; off + 3 <= len && (uint16_t)(off + 3) <= pln; off += 3) {
 			uint8_t settings_key = pl[off];
 			uint16_t settings_val = pl[off + 1] + 256 * pl[off + 2];
 			if (settings_key == SETTING_LIZARD_MODE &&
@@ -524,6 +524,7 @@ static void handleSet(int slot, uint8_t rid, hid_report_type_t type,
 				// from a host-suspend broadcast -- would land on the new controller).
 				if (!wasUsed)
 					relayClearSlot((uint8_t)slot);
+				evictDuplicateSerialBonds(slot);
 			}
 			g_dirty = true;
 #if OPK_LOG
@@ -755,7 +756,7 @@ void SteamPuckController::onReport45(int slot, const uint8_t *rep, bool fresh,
 				lizSlot = s;
 				break;
 			}
-		if (slot == lizSlot)
+		if (fresh && slot == lizSlot)
 			rfLizard(&hid[0], &hid[0], 0x40, 0x41);
 	} else {
 		// body length after the id byte, clamped to the descriptor's declared size for this report id

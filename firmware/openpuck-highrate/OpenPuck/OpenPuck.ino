@@ -195,6 +195,10 @@ void setup()
 	// clean-PS modes skip BOTH the wake mouse and WebUSB -- no config panel / host-wake; chord back to Steam
 	// (back-paddle 4 + A) to reach the panel. Normal MODE_PS5 / MODE_HIDGYRO keep wake + panel.
 	const bool psClean = modeIsCleanPS(g_usbMode);
+	// MODE_XBOX reserves IF 0..3 and EP 1..6 IN/OUT to match a retail wired
+	// Xbox 360 controller (045E:028E); adding wake-mouse or WebUSB overflows
+	// nRF52840 endpoints and makes Windows xusb22.sys reject child enumeration.
+	const bool bareUsb = psClean || (g_usbMode == MODE_XBOX);
 	const bool dynamic = g_active->dynamicMount();
 
 	if (dynamic) {
@@ -236,8 +240,9 @@ void setup()
 		// identity. Steam keeps the exact unit serial (its pairing identity); the others get a 1-char suffix.
 		if (puckMode) {
 			USBDevice.setSerialDescriptor(g_unit);
-		} else {
+		} else if (g_usbMode != MODE_XBOX) {
 			// Bond count in serial so Windows invalidates its cached config descriptor if the count changes.
+			// MODE_XBOX sets its own 12-hex-digit XSM3 serial inside XboxController::begin().
 			snprintf(g_usbSerial, sizeof g_usbSerial, "%s%c%d",
 				 g_unit, MODE_SUFFIX[g_usbMode - 1],
 				 bondedSlotCount() > 0 ? bondedSlotCount() : 1);
@@ -264,15 +269,15 @@ void setup()
 			usb_web.begin();
 #endif
 
-		// Boot-mouse wake interface for clean (non-puck) modes, and for puck on the one-shot debug boot (CDC on,
-		// no endpoint room for wake mouse on a normal puck boot -- wake is registered above instead). Skipped for PS
-		// modes so the device stays a single clean HID gamepad (see psClean above).
-		if (!puckMode && !keepCdc && !psClean)
+		// Boot-mouse wake interface for composite non-puck modes, and for puck on the one-shot debug boot (CDC on,
+		// no endpoint room for wake mouse on a normal puck boot -- wake is registered above instead). Skipped for
+		// bare console/XInput personalities (clean PS + Xbox 360) that forbid extra USB interfaces.
+		if (!puckMode && !keepCdc && !bareUsb)
 			wakeHidBegin();
 
-		// WebUSB config panel -- every mode EXCEPT the PlayStation modes. Puck: registered above (IF 0) before wake +
-		// slots; other clean modes after controller. PS modes omit it to present a genuine single-HID PS controller.
-		if (!puckMode && !psClean)
+		// WebUSB config panel -- every mode EXCEPT bare console/XInput personalities (clean PS + Xbox 360).
+		// Puck: registered above (IF 0) before wake + slots; other composite modes after controller.
+		if (!puckMode && !bareUsb)
 			usb_web.begin();
 		// bmAttributes: required(0x80) | remote_wakeup(0x20). Remote Wakeup lets us signal wake-from-sleep.
 		// The PS3/Sixaxis (the only clean-PS mode on this static path) advertises 0x80 only -- match it so a
@@ -296,7 +301,7 @@ void setup()
 	webusbInit(); // also drain the WebUSB status blob from the usbd task (its flush() can block loop() too)
 	hapticInit();
 	static const char *MODE_NAME[] = {
-		"STEAM(puck)",		 "XBOX(xinput+mouse)",
+		"STEAM(puck)",		 "XBOX(xinput)",
 		"SWITCH(horipad)",	 "LIZARD(puck kb/mouse)",
 		"SWITCH(pro+gyro)",	 "PS5(dualsense)",
 		"HIDGYRO(ds4+motion)",	 "PS5(dualsense,game/clean)",

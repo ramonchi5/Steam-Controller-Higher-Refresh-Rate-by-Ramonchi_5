@@ -115,6 +115,7 @@ public static class Uf2Converter
                     if (!pages.TryGetValue(aligned, out byte[]? pageData))
                     {
                         pageData = new byte[256];
+                        Array.Fill(pageData, (byte)0xFF);
                         pages[aligned] = pageData;
                     }
 

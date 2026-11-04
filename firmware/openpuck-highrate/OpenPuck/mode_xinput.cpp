@@ -517,7 +517,7 @@ void XboxController::onReport45(int slot, const uint8_t *rep, bool fresh,
 	bool selected = g_xi.bond == slot;
 	uint32_t generation = g_xiGeneration;
 	__set_PRIMASK(pm);
-	if (selected)
+	if (selected && fresh)
 		rfXboxGamepad((uint8_t)slot, generation, rep);
 }
 

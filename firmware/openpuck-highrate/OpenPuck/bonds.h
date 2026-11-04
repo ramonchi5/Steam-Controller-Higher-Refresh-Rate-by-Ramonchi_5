@@ -34,6 +34,7 @@ extern volatile bool g_dirty; // bonds changed -> flush to flash from loop()
 extern bool g_pairing;
 
 bool recEmpty(const uint8_t *r);
+void evictDuplicateSerialBonds(int keepSlot);
 void loadBonds();
 void saveBonds();
 int bondedSlotCount();

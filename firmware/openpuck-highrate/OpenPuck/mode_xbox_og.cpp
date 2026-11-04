@@ -763,8 +763,7 @@ void XboxOgController::begin()
 void XboxOgController::onReport45(int slot, const uint8_t *rep, bool fresh,
 				  uint8_t bodyTlen)
 {
-	(void)fresh;
-	if (!rep || slot < 0 || slot >= NSLOT || bodyTlen < 18 ||
+	if (!fresh || !rep || slot < 0 || slot >= NSLOT || bodyTlen < 18 ||
 	    (rep[0] != 0x45 && rep[0] != 0x42) ||
 	    g_xboxOgSlot.bond_slot != slot)
 		return;
